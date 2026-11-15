@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Fills in mikrotik/nibe-hub.app.yaml with .env and the MCP server's TLS files.
+"""Fills in mikrotik/nibe-hub.yaml with .env and the MCP server's TLS files.
 
     python3 tools/make_app_yaml.py --cert cert.pem --key key.pem [--env .env]
-        [--image ghcr.io/<you>/nibe-hub:latest] [--out mikrotik/nibe-hub.app.local.yaml]
+        [--image ghcr.io/<you>/nibe-hub:latest] [--out mikrotik/nibe-hub-local.yaml]
 
 The output contains the pump password, the MCP token and the TLS key: it is written with
 mode 0600 and is git-ignored. Each service gets only its own settings, as with
@@ -11,14 +11,14 @@ tools/run_local.sh: the collector the NIBE_* lines, the MCP server the MCP_* lin
 import argparse, json, os, re, subprocess, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-TEMPLATE = os.path.join(ROOT, "mikrotik", "nibe-hub.app.yaml")
+TEMPLATE = os.path.join(ROOT, "mikrotik", "nibe-hub.yaml")
 
 ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
 ap.add_argument("--env", default=os.path.join(ROOT, ".env"))
 ap.add_argument("--cert", required=True, help="PEM certificate for the MCP server (its SAN must contain the app's IP)")
 ap.add_argument("--key", required=True, help="PEM private key for --cert")
 ap.add_argument("--image", default="ghcr.io/kkerssem/nibe-hub:latest")
-ap.add_argument("--out", default=os.path.join(ROOT, "mikrotik", "nibe-hub.app.local.yaml"))
+ap.add_argument("--out", default=os.path.join(ROOT, "mikrotik", "nibe-hub-local.yaml"))
 args = ap.parse_args()
 
 

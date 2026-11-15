@@ -1,13 +1,13 @@
 # MikroTik App definition for nibe-hub (RouterOS 7.26+ with the container package).
 #
 # This file contains no secrets and can be added as it is:
-#   /app/add yaml=[/file/get nibe-hub.app.yaml contents]
+#   /app/add yaml=[/file/get nibe-hub.yaml contents]
 # Then fill in the empty values below on the router before /app/enable. Until they are set,
 # both services stop at startup with a message saying what is missing:
 #   collector: NIBE_URL, NIBE_USER, NIBE_PASS, NIBE_TLS_FINGERPRINT
 #   mcp:       MCP_TOKEN, and the certificate and key in the configs mcp-tls-cert and mcp-tls-key
 # Alternatively, python3 tools/make_app_yaml.py --cert cert.pem --key key.pem fills them in from
-# .env and writes mikrotik/nibe-hub.app.local.yaml (git-ignored, because it then contains the
+# .env and writes mikrotik/nibe-hub-local.yaml (git-ignored, because it then contains the
 # pump password, the MCP token and the TLS key).
 #
 # Both services share one VETH on an existing bridge, so the MCP server is reachable at that
