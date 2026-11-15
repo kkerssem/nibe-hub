@@ -68,6 +68,8 @@ container exec -d --env-file <MCP settings> nibe /nibe-mcp
 
 Both processes run as root in the same VM, so this split keeps secrets out of each other's environment but is not a hard boundary. The MCP port is published on 127.0.0.1 only, so the token never crosses the network.
 
+`up` refuses to start without `MCP_TOKEN`. If the collector or the MCP server fails to start, `up` prints its error and exits with a non-zero status. Windows line endings in `.env` are stripped; a comment after a value is not (it becomes part of the value).
+
 The MCP process does not restart on its own. After a reboot, or after the container stops, run `tools/run_local.sh up` again. Check the server with `curl http://127.0.0.1:8080/healthz`.
 
 ### Testing without a pump
@@ -145,10 +147,20 @@ Upload both files to `/usb1/nibe-tls` on the router and keep `cert.pem` on the M
 The pump uses a self-signed certificate. Instead of turning verification off, pin it: the collector then accepts only that exact certificate, so a device that takes over the pump's IP address never gets the pump password. Read the fingerprint from the pump once:
 
 ```sh
-openssl s_client -connect 192.168.1.50:8443 </dev/null 2>/dev/null | openssl x509 -noout -fingerprint -sha256
+openssl s_client -connect 192.168.1.50:8443 </dev/null 2>/dev/null | openssl x509 -noout -fingerprint -sha256 -subject
 ```
 
-Put the value after `=` in `NIBE_TLS_FINGERPRINT`; colons and case don't matter. If the pump gets a new certificate (for example after a firmware update or factory reset), polls fail with a fingerprint mismatch in the log, and you update the value.
+Put the value after `Fingerprint=` in `NIBE_TLS_FINGERPRINT`; colons and case don't matter.
+
+This reading itself trusts whatever answers at the pump's address at that moment, so make it count:
+
+- Read it over a network you trust, ideally from a machine on the same switch or Wi-Fi as the pump, not over a VPN or guest network.
+- Read it a second time from another device (for example a laptop on a different connection, or a day later) and check that both values match.
+- Check the subject: the pump's certificate shows `O=NIBE` and a numeric `CN`.
+
+If the pump gets a new certificate (for example after a firmware update, a factory reset or when it expires), polls fail with a fingerprint mismatch in the log. Read and check the new value the same way before you update `NIBE_TLS_FINGERPRINT`.
+
+An empty `NIBE_TLS_FINGERPRINT=` line is an error rather than "not set", so a template value left unfilled is caught at startup. Without the line, the collector verifies the certificate against the system CAs, which only works for a pump behind a proxy with a CA-signed certificate; it warns at startup when `NIBE_URL` is an IP address in that mode.
 
 `NIBE_INSECURE_TLS=true` still turns verification off completely, for a quick test.
 
@@ -173,8 +185,8 @@ A self-refreshing dashboard artifact needs HTTPS on port 443 with a publicly tru
 |---|---|---|
 | `NIBE_URL`, `NIBE_USER`, `NIBE_PASS` | | required (collector) |
 | `NIBE_POLL_SECS` | 60 | minimum 10 |
-| `NIBE_FAST_IDS`, `NIBE_FAST_SECS` | empty, 10 | fast poll per point via `/points/<id>` |
-| `NIBE_TLS_FINGERPRINT` | | SHA-256 of the pump's certificate; without it the certificate is checked against the system CAs, which fails for the pump |
+| `NIBE_FAST_IDS`, `NIBE_FAST_SECS` | empty, 10 | fast poll per point via `/points/<id>`; ids the pump doesn't report are skipped with a warning |
+| `NIBE_TLS_FINGERPRINT` | | SHA-256 of the pump's certificate; an empty value is an error; without the variable the certificate is checked against the system CAs, which fails for the pump |
 | `NIBE_INSECURE_TLS` | false | `true` turns certificate verification off; not together with `NIBE_TLS_FINGERPRINT` |
 | `DB_PATH` | /data/nibe.db | |
 | `MCP_TOKEN` | | required, or `MCP_ALLOW_NO_AUTH=true` |
@@ -186,6 +198,6 @@ Both binaries stop cleanly on SIGTERM (what `container stop` and RouterOS send) 
 ## Still to verify on the real pump
 
 1. **Meaning of points 28392/28393** ("Tot. production/consumption"). After a day, run `cop` with bucket `1d`; if `counter_consumed_kwh` ≈ `elec_unit_kwh` (the integral of point 22130), the interpretation is correct. Power points 1801 and 22130 are new compared to the Loxone route.
-2. **Fast poll**: the response of `/points/<id>` is undocumented; test `curl -k -u user:pass https://IP:8443/api/v1/devices/0/points/1801` before enabling `NIBE_FAST_IDS`.
-3. **Certificate pinning** works against the mock; check that the real pump's certificate stays the same across reboots.
+2. ~~**Fast poll**~~ (checked on 2026-11-15): `/points/<id>` returns a single point object, the same shape as an entry of `/points`, in about 15 ms; an unknown id gives HTTP 404 with `{"error": "Point not found"}`. `NIBE_FAST_IDS` can be enabled. After the first full poll the collector checks the ids against the pump's catalogue and skips unknown ones with a warning; during fast polling a failing id is skipped for that round without losing the other values.
+3. **Certificate pinning** works against the real pump (a self-signed X.509 v3 EC certificate, valid until 3 October 2027). Check that it stays the same across pump reboots; after it is renewed, update `NIBE_TLS_FINGERPRINT`.
 4. The arm64 image builds with Apple Containers and runs locally against the mock, but the image import and the RouterOS commands have not been tried on a real RB5009.

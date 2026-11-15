@@ -39,11 +39,28 @@ fn env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.trim().is_empty())
 }
 
+/// A whole number from the environment, with an error that shows the offending value
+/// (a trailing comment such as `60 # once a minute` is the usual cause).
+fn env_num<T: std::str::FromStr>(key: &str, default: T) -> Result<T> {
+    match env(key) {
+        None => Ok(default),
+        Some(v) => v.trim().parse().map_err(|_| anyhow!("{key}={v:?} is not a whole number (comments after a value are not allowed)")),
+    }
+}
+
 impl Config {
     fn from_env() -> Result<Self> {
         let base_url = env("NIBE_URL").ok_or_else(|| anyhow!("NIBE_URL is missing (e.g. https://192.168.1.50:8443)"))?;
-        let poll = env("NIBE_POLL_SECS").map(|v| v.parse::<u64>()).transpose().context("NIBE_POLL_SECS")?.unwrap_or(60);
-        let fast = env("NIBE_FAST_SECS").map(|v| v.parse::<u64>()).transpose().context("NIBE_FAST_SECS")?.unwrap_or(10);
+        // Use the parser's normalised form, so the logs show the address actually used
+        // (e.g. a missing "//" in "https:192.168.1.50:8443" is accepted and corrected).
+        let base_url = match reqwest::Url::parse(base_url.trim()) {
+            Ok(u) if matches!(u.scheme(), "http" | "https") && u.host_str().is_some_and(|h| !h.is_empty()) => {
+                u.as_str().trim_end_matches('/').to_string()
+            }
+            _ => bail!("NIBE_URL={base_url:?} is not a valid URL; expected something like https://192.168.1.50:8443"),
+        };
+        let poll: u64 = env_num("NIBE_POLL_SECS", 60)?;
+        let fast: u64 = env_num("NIBE_FAST_SECS", 10)?;
         if poll < 10 || fast < 2 {
             bail!("NIBE_POLL_SECS must be ≥ 10 and NIBE_FAST_SECS ≥ 2; the pump is not a database");
         }
@@ -53,6 +70,11 @@ impl Config {
             .context("NIBE_FAST_IDS must be a comma-separated list of point ids")?
             .unwrap_or_default();
         let insecure = env("NIBE_INSECURE_TLS").map(|v| v == "true" || v == "1").unwrap_or(false);
+        // An empty NIBE_TLS_FINGERPRINT= line (as in the template) is a setting left unfilled,
+        // not a request for CA verification, which always fails against the pump.
+        if std::env::var("NIBE_TLS_FINGERPRINT").is_ok_and(|v| v.trim().is_empty()) && !insecure {
+            bail!("NIBE_TLS_FINGERPRINT is empty: fill in the pump's certificate fingerprint (see README), or remove the line to verify against the system CAs");
+        }
         let tls = match env("NIBE_TLS_FINGERPRINT") {
             Some(fp) => {
                 if insecure {
@@ -64,10 +86,10 @@ impl Config {
             None => TlsMode::Verify,
         };
         Ok(Self {
-            base_url: base_url.trim_end_matches('/').to_string(),
+            base_url,
             user: env("NIBE_USER").ok_or_else(|| anyhow!("NIBE_USER is missing"))?,
             pass: env("NIBE_PASS").ok_or_else(|| anyhow!("NIBE_PASS is missing"))?,
-            device: env("NIBE_DEVICE").map(|v| v.parse()).transpose()?.unwrap_or(0),
+            device: env_num("NIBE_DEVICE", 0)?,
             tls,
             poll: Duration::from_secs(poll),
             fast_ids,
@@ -160,7 +182,9 @@ fn to_values(pts: &BTreeMap<i64, ApiPoint>) -> Vec<(i64, Option<i64>)> {
     pts.iter().map(|(id, p)| (*id, p.raw())).collect()
 }
 
-async fn full_poll(client: &reqwest::Client, cfg: &Config, tx: &mpsc::Sender<Msg>, first: bool) -> Result<(usize, usize)> {
+/// One full poll. Returns the number of points, the number of changed values, and the ids
+/// the pump reported.
+async fn full_poll(client: &reqwest::Client, cfg: &Config, tx: &mpsc::Sender<Msg>, first: bool) -> Result<(usize, usize, Vec<i64>)> {
     let t0 = Instant::now();
     let body = match get(client, cfg, "/points").await {
         Ok(b) => b,
@@ -180,6 +204,7 @@ async fn full_poll(client: &reqwest::Client, cfg: &Config, tx: &mpsc::Sender<Msg
         }
     };
     let n = pts.len();
+    let ids: Vec<i64> = pts.keys().copied().collect();
     let values = to_values(&pts);
     // the catalogue (titles, units, scale) only changes with a firmware update: refresh at startup and daily
     if first {
@@ -189,44 +214,62 @@ async fn full_poll(client: &reqwest::Client, cfg: &Config, tx: &mpsc::Sender<Msg
     let duration_ms = t0.elapsed().as_millis() as i64;
     tx.send(Msg::Sample { ts_ms, kind: "full", values, duration_ms, reply }).await.map_err(|_| anyhow!("writer has stopped"))?;
     let changed = rx.await.unwrap_or(0);
-    Ok((n, changed))
+    Ok((n, changed, ids))
 }
 
-async fn fast_loop(client: reqwest::Client, cfg: std::sync::Arc<Config>, tx: mpsc::Sender<Msg>) {
+/// Splits the configured fast-poll ids into those the pump knows and those it does not.
+fn check_fast_ids(wanted: &[i64], known: &[i64]) -> (Vec<i64>, Vec<i64>) {
+    wanted.iter().partition(|id| known.binary_search(id).is_ok())
+}
+
+/// Polls `ids` one by one. A failing id is skipped for that round instead of discarding
+/// the values of the others; the round only counts as failed when no id succeeded.
+async fn fast_loop(client: reqwest::Client, cfg: std::sync::Arc<Config>, ids: Vec<i64>, tx: mpsc::Sender<Msg>) {
     let mut tick = tokio::time::interval(cfg.fast);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut fails = 0u32;
+    let mut partial = 0u32;
     loop {
         tick.tick().await;
         let t0 = Instant::now();
         let mut values = Vec::new();
-        let mut err = None;
-        for id in &cfg.fast_ids {
-            match get(&client, &cfg, &format!("/points/{id}")).await.and_then(|b| parse_point_response(&b)) {
+        let mut errors = Vec::new();
+        for id in &ids {
+            let res = get(&client, &cfg, &format!("/points/{id}")).await.and_then(|b| parse_point_response(&b));
+            match res {
                 Ok(pts) => {
                     for p in pts {
                         values.push((p.metadata.variable_id, normalize_raw(&p.metadata.variable_size, p.value.is_ok, p.value.integer_value)));
                     }
                 }
-                Err(e) => {
-                    err = Some(format!("{e:#}"));
-                    break;
-                }
+                Err(e) => errors.push(format!("point {id}: {e:#}")),
             }
         }
         let ts_ms = now_ms();
-        if let Some(e) = err {
+        let duration_ms = t0.elapsed().as_millis() as i64;
+        if values.is_empty() {
             fails += 1;
+            let e = errors.join("; ");
             if fails == 1 || fails % 30 == 0 {
                 warn!("fast poll failed ({fails}x): {e}");
             }
-            let _ = tx.send(Msg::Failure { ts_ms, kind: "fast", duration_ms: t0.elapsed().as_millis() as i64, error: e }).await;
+            let _ = tx.send(Msg::Failure { ts_ms, kind: "fast", duration_ms, error: e }).await;
             tokio::time::sleep(Duration::from_secs((fails as u64).min(30) * 2)).await;
             continue;
         }
         fails = 0;
+        if errors.is_empty() {
+            partial = 0;
+        } else {
+            partial += 1;
+            let e = errors.join("; ");
+            if partial == 1 || partial % 30 == 0 {
+                warn!("fast poll: {} of {} points failed ({partial}x): {e}", errors.len(), ids.len());
+            }
+            let _ = tx.send(Msg::Failure { ts_ms, kind: "fast", duration_ms, error: e }).await;
+        }
         let (reply, rx) = oneshot::channel();
-        if tx.send(Msg::Sample { ts_ms, kind: "fast", values, duration_ms: t0.elapsed().as_millis() as i64, reply }).await.is_err() {
+        if tx.send(Msg::Sample { ts_ms, kind: "fast", values, duration_ms, reply }).await.is_err() {
             return;
         }
         let _ = rx.await;
@@ -262,7 +305,13 @@ async fn main() -> Result<()> {
 
     let cfg = std::sync::Arc::new(Config::from_env()?);
     info!("NIBE {} (device {}), poll {}s, db {:?}", cfg.base_url, cfg.device, cfg.poll.as_secs(), cfg.db_path);
+    let url_is_ip = reqwest::Url::parse(&cfg.base_url)
+        .ok()
+        .is_some_and(|u| matches!(u.host(), Some(url::Host::Ipv4(_)) | Some(url::Host::Ipv6(_))));
     match &cfg.tls {
+        TlsMode::Verify if url_is_ip && cfg.base_url.starts_with("https:") => warn!(
+            "NIBE_URL is an IP address and NIBE_TLS_FINGERPRINT is not set: CA verification will fail against the pump's self-signed certificate; set NIBE_TLS_FINGERPRINT (see README)"
+        ),
         TlsMode::Verify => info!("TLS certificate is verified against the system CAs; set NIBE_TLS_FINGERPRINT for the pump's self-signed certificate"),
         TlsMode::Pinned(fp) => info!("TLS certificate pinned to SHA-256 {}", tls::fmt_fingerprint(fp)),
         TlsMode::Insecure => warn!("TLS certificate is NOT verified (NIBE_INSECURE_TLS); the pump password goes to whoever answers at NIBE_URL"),
@@ -277,6 +326,7 @@ async fn main() -> Result<()> {
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut first = true;
     let mut fast_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut fast_checked = cfg.fast_ids.is_empty();
     let mut fails = 0u32;
     let mut last_catalog = Instant::now();
     let shutdown = shutdown_signal();
@@ -293,7 +343,7 @@ async fn main() -> Result<()> {
             _ = &mut shutdown => { info!("stopping"); break; }
         };
         match result {
-            Ok((n, changed)) => {
+            Ok((n, changed, known_ids)) => {
                 if fails > 0 {
                     info!("connection restored after {fails} failed polls");
                 }
@@ -307,16 +357,26 @@ async fn main() -> Result<()> {
                     tracing::debug!("{n} points, {changed} changed");
                 }
                 first = false;
-                if fast_task.is_none() && !cfg.fast_ids.is_empty() {
-                    info!("fast poll for {:?} every {}s", cfg.fast_ids, cfg.fast.as_secs());
-                    fast_task = Some(tokio::spawn(fast_loop(client.clone(), cfg.clone(), tx.clone())));
+                if !fast_checked {
+                    // check the ids against what the pump actually reports, once
+                    fast_checked = true;
+                    let (ok, unknown) = check_fast_ids(&cfg.fast_ids, &known_ids);
+                    if !unknown.is_empty() {
+                        warn!("NIBE_FAST_IDS: the pump has no point {unknown:?}; fast polling skips it (check for a typo)");
+                    }
+                    if ok.is_empty() {
+                        warn!("NIBE_FAST_IDS: none of the ids exist; fast polling is off");
+                    } else {
+                        info!("fast poll for {ok:?} every {}s", cfg.fast.as_secs());
+                        fast_task = Some(tokio::spawn(fast_loop(client.clone(), cfg.clone(), ok, tx.clone())));
+                    }
                 }
             }
             Err(e) => {
                 fails += 1;
                 if fails == 1 || fails % 10 == 0 {
                     warn!("poll failed ({fails}x in a row): {e:#}");
-                    if fails == 1 && matches!(cfg.tls, TlsMode::Verify) && format!("{e:#}").to_lowercase().contains("certificate") {
+                    if matches!(cfg.tls, TlsMode::Verify) && format!("{e:#}").to_lowercase().contains("certificate") {
                         warn!("the pump uses a self-signed certificate: set NIBE_TLS_FINGERPRINT (see README)");
                     }
                 }
@@ -333,4 +393,17 @@ async fn main() -> Result<()> {
     let _ = tokio::task::spawn_blocking(move || writer.join()).await;
     info!("stopped");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_fast_ids_are_split_off() {
+        let known = [4, 1801, 22130]; // sorted, as the full poll returns them
+        assert_eq!(check_fast_ids(&[1801, 2213], &known), (vec![1801], vec![2213]));
+        assert_eq!(check_fast_ids(&[22130, 1801], &known), (vec![22130, 1801], vec![]));
+        assert_eq!(check_fast_ids(&[9], &known), (vec![], vec![9]));
+    }
 }
