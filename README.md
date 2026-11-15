@@ -199,7 +199,7 @@ For that VLAN:
 
      This writes `mikrotik/nibe-hub-local.yaml` (mode 0600, git-ignored). It contains the pump password, the MCP token and the TLS key, because RouterOS generates the values of app `secrets` itself and the documentation describes no way to supply your own. Each service gets only its own settings, as with `run_local.sh`, and only the optional settings that are in `.env`. Add `--image ghcr.io/kkerssem/nibe-hub:<short-sha>` to pin a version instead of `latest`; each workflow run lists its tags in its summary.
 
-4. **Add the app on the router.** Upload the file (`nibe-hub.yaml` or `nibe-hub-local.yaml`; keep a single `.yaml` extension, as RouterOS didn't handle a name like `nibe-hub.app.yaml`), then:
+4. **Add the app on the router.** Either add the file without secrets straight from its raw GitHub URL (`https://raw.githubusercontent.com/kkerssem/nibe-hub/main/mikrotik/nibe-hub.yaml`), or upload the file (`nibe-hub.yaml` or `nibe-hub-local.yaml`; keep a single `.yaml` extension, as RouterOS didn't handle a name like `nibe-hub.app.yaml`), then:
 
    ```routeros
    /app/settings/set disk=usb1 lan-bridge=<your-bridge>
@@ -249,6 +249,8 @@ Tried with the file without secrets, on a vlan-filtering bridge with the app on 
 - `use-https=no` is needed (see step 4), and the image package must be public (see step 1).
 - The environment values and the contents of the `mcp-tls-cert` and `mcp-tls-key` configs can be filled in on the router after `/app/add`.
 - `command:` picks the binary per service: the collector polls the pump (pinned certificate, full poll every 60 s, fast polling of 1801 and 22130), and the MCP server answers on `https://<app-ip>/mcp` with the certificate for that address. Requests without a token or with a wrong one get `401`; all six tools work.
+- `healthcheck` is accepted; each container's Healthcheck tab shows the result of `/nibe-collector health` and `/nibe-mcp health`.
+- **Updating:** for an app added from the raw GitHub URL, the app's **Update** action fetches the YAML from that URL again and pulls the images again. The values filled in on the router (environment and TLS configs) were kept, both services came back running, and the `data` volume, with its history, survived. The restart took less than the 3-minute gap threshold, so the history shows no gap.
 - Resource use (RouterOS app stats): about 4 MiB of memory for both services, an image of 21.7 MiB, around 1 MiB of data after the first hour, and short CPU blips of 0.2–0.3 % at each full poll.
 
 ### Still to check on the RB5009
@@ -256,7 +258,8 @@ Tried with the file without secrets, on a vlan-filtering bridge with the app on 
 - that the VETH's `mac-address` stays the same after `/app/restart`, `/app/disable` and `/app/enable`; if it changes, the static lease no longer matches
 - whether a generated app secret can be read back (see above), which would keep the MCP token out of the YAML
 - how fast the database grows over days and weeks (`db_megabytes` in the `status` tool)
-- that the `healthcheck` of both services is accepted, and what RouterOS does when one fails: only show it, or restart the service
+- what RouterOS does when a `healthcheck` fails: only show it, or restart the service. To test, stop the pump's API briefly or set a wrong `NIBE_PASS`; if it restarts the collector, a pump outage turns into a restart loop, and the collector check should become a liveness check
+- whether an app added from an uploaded file (rather than a URL) can be updated the same way
 
 ## The pump's TLS certificate
 
