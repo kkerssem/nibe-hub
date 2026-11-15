@@ -160,7 +160,7 @@ networks:
 - **`external: true`** means: use an existing bridge. Without it, RouterOS puts the app on its own `internal` network (`172.18.0.1/24`) behind NAT with a masquerade rule, and only ports listed under `ports` would be reachable, through dst-nat rules on the router's own address.
 - **`lan`** is not something you create: it is an alias for the bridge set as `lan-bridge` in `/app/settings`. When that is empty, RouterOS uses the bridge it detected itself, shown as the read-only `assumed-lan-bridge`. Check with `/app/settings/print`.
 - **Another bridge:** external networks also accept a bridge name, so `name: <bridge-name>` attaches the app to that bridge regardless of `lan-bridge`. Use this when each of your networks has its own bridge.
-- **One VETH for the app:** RouterOS creates a single `veth-app-<app>` per app, so both services most likely share one address. Only the MCP server listens on it.
+- **One VETH for the app:** RouterOS creates a single `veth-app-<app>` per app, so both services share one address (verified on an RB5009). Only the MCP server listens on it.
 
 ### Running the app on a VLAN
 
@@ -245,7 +245,7 @@ Tried with the file without secrets, on a vlan-filtering bridge with the app on 
 
 - RouterOS reads [mikrotik/nibe-hub.yaml](mikrotik/nibe-hub.yaml) with `/app/add`, including the empty environment values (`NIBE_PASS: ""`).
 - Before enabling, the bridge and `network-pvid` can be changed on the router; the app's bridge port becomes active on that bridge with that PVID.
-- The app's VETH gets its address from the DHCP server of that VLAN.
+- RouterOS creates a single VETH for the app, so both services share it and its address; the VETH gets that address from the DHCP server of that VLAN.
 - `use-https=no` is needed (see step 4), and the image package must be public (see step 1).
 - The environment values and the contents of the `mcp-tls-cert` and `mcp-tls-key` configs can be filled in on the router after `/app/add`.
 - `command:` picks the binary per service: the collector polls the pump (pinned certificate, full poll every 60 s, fast polling of 1801 and 22130), and the MCP server answers on `https://<app-ip>/mcp` with the certificate for that address. Requests without a token or with a wrong one get `401`; all six tools work.
@@ -254,7 +254,6 @@ Tried with the file without secrets, on a vlan-filtering bridge with the app on 
 ### Still to check on the RB5009
 
 - that the VETH's `mac-address` stays the same after `/app/restart`, `/app/disable` and `/app/enable`; if it changes, the static lease no longer matches
-- that both services share the one VETH, as the single `veth-app-<app>` name suggests
 - whether a generated app secret can be read back (see above), which would keep the MCP token out of the YAML
 - how fast the database grows over days and weeks (`db_megabytes` in the `status` tool)
 - that the `healthcheck` of both services is accepted, and what RouterOS does when one fails: only show it, or restart the service
