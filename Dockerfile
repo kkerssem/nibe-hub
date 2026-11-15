@@ -14,7 +14,10 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/nibe-core/Cargo.toml crates/nibe-core/
 COPY crates/nibe-collector/Cargo.toml crates/nibe-collector/
 COPY crates/nibe-mcp/Cargo.toml crates/nibe-mcp/
+#    The stub sources use none of the dependencies, so cargo's unused_dependencies lint is
+#    turned off for this step only; step 2 copies the real manifests over these.
 RUN mkdir -p crates/nibe-core/src crates/nibe-collector/src crates/nibe-mcp/src \
+ && for m in crates/*/Cargo.toml; do printf '\n[lints.cargo]\nunused_dependencies = "allow"\n' >> "$m"; done \
  && touch crates/nibe-core/src/lib.rs \
  && echo 'fn main() {}' > crates/nibe-collector/src/main.rs \
  && echo 'fn main() {}' > crates/nibe-mcp/src/main.rs \
