@@ -19,12 +19,20 @@ RUN mkdir -p crates/nibe-core/src crates/nibe-collector/src crates/nibe-mcp/src 
  && echo 'fn main() {}' > crates/nibe-collector/src/main.rs \
  && echo 'fn main() {}' > crates/nibe-mcp/src/main.rs \
  && cargo build --release --locked \
- && rm -rf crates/*/src target/release/.fingerprint/nibe-* target/release/deps/*nibe_* target/release/nibe-*
+ && cargo clean --release -p nibe-core -p nibe-collector -p nibe-mcp \
+ && rm -rf crates/*/src
 
 # 2. The workspace crates. A code change only rebuilds from here.
+#    The stub builds are cleaned above, and the sources are touched because COPY keeps their
+#    original timestamps (with buildx these can be older than the stub build, and cargo would
+#    then consider the stubs up to date).
 COPY crates crates
-RUN cargo build --release --locked \
- && mkdir /out && cp target/release/nibe-collector target/release/nibe-mcp /out/
+RUN find crates -type f -exec touch {} + \
+ && cargo build --release --locked \
+ && mkdir /out && cp target/release/nibe-collector target/release/nibe-mcp /out/ \
+ && /out/nibe-collector 2>&1 | grep -q 'NIBE_URL is missing' \
+ && /out/nibe-mcp 2>&1 | grep -q 'MCP_TOKEN is missing' \
+ || { echo 'the built binaries are not the real nibe-collector/nibe-mcp' >&2; exit 1; }
 
 FROM scratch
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
