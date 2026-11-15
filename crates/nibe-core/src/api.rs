@@ -104,6 +104,11 @@ pub fn parse_point_response(body: &[u8]) -> Result<Vec<ApiPoint>> {
         }
         _ => return Err(anyhow!("unexpected response to point request")),
     }
+    // An empty answer is not a successful read: without this, `{}` or `[]` would store
+    // nothing and still count as a good poll.
+    if out.is_empty() {
+        return Err(anyhow!("empty response to point request"));
+    }
     Ok(out)
 }
 
@@ -129,8 +134,11 @@ mod tests {
     }
 
     #[test]
-    fn not_found_response_is_an_error() {
+    fn not_found_and_empty_responses_are_errors() {
         // the pump answers 404 with this body; `get` fails on the status first, but the parser must not accept it either
         assert!(parse_point_response(br#"{"error": "Point not found"}"#).is_err());
+        // a 200 with no points must not count as a successful read
+        assert!(parse_point_response(b"{}").is_err());
+        assert!(parse_point_response(b"[]").is_err());
     }
 }
