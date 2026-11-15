@@ -144,6 +144,10 @@ pub fn series_table(reader: &Reader, tz: Tz, ids: &[i64], from: i64, to: i64, bu
 }
 
 /// Efficiency per bucket from the counter and power points of the S735C.
+///
+/// Heat comes from the energy-log counters 27378/27379 (compressor only) and 27382/27383
+/// (including additional heat); electricity comes from the integral of the measured power.
+/// The lifetime counters 28392/28393 only move in coarse steps and are reported for information only.
 pub fn cop_table(reader: &Reader, tz: Tz, from: i64, to: i64, bucket: Bucket) -> Result<Value> {
     if bucket == Bucket::Raw {
         bail!("choose a bucket (e.g. 1h or 1d)");
@@ -162,19 +166,25 @@ pub fn cop_table(reader: &Reader, tz: Tz, from: i64, to: i64, bucket: Bucket) ->
     };
     let (unit_i, unit_s) = need(wk::UNIT_POWER_W)?;
     let (comp_i, comp_s) = need(wk::COMPRESSOR_POWER_W)?;
+    let (h_co_i, h_co_s) = need(wk::HEATING_COMPRESSOR_ONLY_KWH)?;
+    let (w_co_i, w_co_s) = need(wk::HOTWATER_COMPRESSOR_ONLY_KWH)?;
+    let (h_in_i, h_in_s) = need(wk::HEATING_INCL_ADDITIONAL_KWH)?;
+    let (w_in_i, w_in_s) = need(wk::HOTWATER_INCL_ADDITIONAL_KWH)?;
     let (prod_i, prod_s) = need(wk::LIFETIME_PRODUCTION_KWH)?;
     let (cons_i, cons_s) = need(wk::LIFETIME_CONSUMPTION_KWH)?;
-    let (heat_i, heat_s) = need(wk::HEATING_COMPRESSOR_ONLY_KWH)?;
-    let (hw_i, hw_s) = need(wk::HOTWATER_COMPRESSOR_ONLY_KWH)?;
     let (out_i, out_s) = need(wk::OUTDOOR_BT1)?;
     let (exh_i, exh_s) = need(wk::EXHAUST_BT20)?;
     let (on_i, on_s) = need(wk::COMPRESSOR_STATUS)?;
 
     let columns = [
-        "time", "coverage", "elec_unit_kwh", "elec_compressor_kwh", "counter_consumed_kwh", "counter_produced_kwh",
-        "cop_counters", "cop_produced_vs_integrated", "counter_heating_kwh", "counter_hotwater_kwh",
-        "outdoor_avg_c", "exhaust_avg_c", "compressor_on_fraction",
+        "time", "coverage", "elec_unit_kwh", "elec_compressor_kwh", "heat_kwh", "heat_compressor_only_kwh",
+        "cop_unit", "cop_compressor", "heating_kwh", "hotwater_kwh", "lifetime_produced_delta_kwh",
+        "lifetime_consumed_delta_kwh", "outdoor_avg_c", "exhaust_avg_c", "compressor_on_fraction",
     ];
+    let sum = |a: Option<f64>, b: Option<f64>| match (a, b) {
+        (Some(x), Some(y)) => Some(x + y),
+        _ => None,
+    };
     let mut rows = Vec::new();
     for e in &edges {
         let (b0, b1) = (e.0.max(from), e.1.min(to));
@@ -182,21 +192,33 @@ pub fn cop_table(reader: &Reader, tz: Tz, from: i64, to: i64, bucket: Bucket) ->
         let cov_frac = stat(&unit_s, b0, b1).covered_ms as f64 / len;
         let elec_unit = aggregate(&unit_s, b0, b1, Agg::IntegralKwh, &unit_i.unit);
         let elec_comp = aggregate(&comp_s, b0, b1, Agg::IntegralKwh, &comp_i.unit);
-        let cons = aggregate(&cons_s, b0, b1, Agg::Delta, &cons_i.unit);
-        let prod = aggregate(&prod_s, b0, b1, Agg::Delta, &prod_i.unit);
-        let cop_counters = match (prod, cons) {
-            (Some(p), Some(c)) if c >= 0.5 && p >= 0.0 => Some(p / c),
+        let heating = aggregate(&h_in_s, b0, b1, Agg::Delta, &h_in_i.unit);
+        let hotwater = aggregate(&w_in_s, b0, b1, Agg::Delta, &w_in_i.unit);
+        let heat = sum(heating, hotwater);
+        let heat_co = sum(
+            aggregate(&h_co_s, b0, b1, Agg::Delta, &h_co_i.unit),
+            aggregate(&w_co_s, b0, b1, Agg::Delta, &w_co_i.unit),
+        );
+        // Only reliable if the electricity was measured over (nearly) the whole bucket.
+        let cop_unit = match (heat, elec_unit) {
+            (Some(h), Some(u)) if u >= 0.5 && h >= 0.0 && cov_frac > 0.9 => Some(h / u),
             _ => None,
         };
-        // Only reliable if the unit's electricity was measured over (nearly) the whole bucket.
-        let cop_integrated = match (prod, elec_unit) {
-            (Some(p), Some(u)) if u >= 0.5 && p >= 0.0 && cov_frac > 0.9 => Some(p / u),
+        let cop_comp = match (heat_co, elec_comp) {
+            (Some(h), Some(u)) if u >= 0.5 && h >= 0.0 && cov_frac > 0.9 => Some(h / u),
             _ => None,
         };
         let cells = [
-            cell(elec_unit), cell(elec_comp), cell(cons), cell(prod), cell(cop_counters), cell(cop_integrated),
-            cell(aggregate(&heat_s, b0, b1, Agg::Delta, &heat_i.unit)),
-            cell(aggregate(&hw_s, b0, b1, Agg::Delta, &hw_i.unit)),
+            cell(elec_unit),
+            cell(elec_comp),
+            cell(heat),
+            cell(heat_co),
+            cell(cop_unit),
+            cell(cop_comp),
+            cell(heating),
+            cell(hotwater),
+            cell(aggregate(&prod_s, b0, b1, Agg::Delta, &prod_i.unit)),
+            cell(aggregate(&cons_s, b0, b1, Agg::Delta, &cons_i.unit)),
             cell(aggregate(&out_s, b0, b1, Agg::Avg, &out_i.unit)),
             cell(aggregate(&exh_s, b0, b1, Agg::Avg, &exh_i.unit)),
             cell(aggregate(&on_s, b0, b1, Agg::Avg, &on_i.unit)),
@@ -212,10 +234,11 @@ pub fn cop_table(reader: &Reader, tz: Tz, from: i64, to: i64, bucket: Bucket) ->
         "timezone": tz.name(), "bucket": bucket.label(),
         "columns": columns, "rows": rows,
         "notes": [
-            "elec_unit_kwh = ∫ 'Instantaneous used power' (point 22130); elec_compressor_kwh = ∫ 'Compressor power input' (point 1801)",
-            "counter_* = difference of the lifetime counters (resolution 0.1 kWh; points 28392/28393 and 27378/27379). The meaning of 28392/28393 is not validated yet: if counter_consumed_kwh ≈ elec_unit_kwh, it is correct.",
-            "cop_counters = counter_produced / counter_consumed (only with ≥ 0.5 kWh consumed); cop_produced_vs_integrated = counter_produced / elec_unit_kwh (only with > 90% coverage)",
-            "COP is based on NIBE's own heat estimate, not an independent heat meter"
+            "elec_unit_kwh = ∫ 'Instantaneous used power' (point 22130, whole unit incl. fans and additional heat); elec_compressor_kwh = ∫ 'Compressor power input' (point 1801)",
+            "heat_kwh = difference of the energy-log counters 27382+27383 (heating + hot water, incl. additional heat); heat_compressor_only_kwh = 27378+27379. Resolution 0.1 kWh, so choose a bucket of 1h or larger.",
+            "cop_unit = heat_kwh / elec_unit_kwh; cop_compressor = heat_compressor_only_kwh / elec_compressor_kwh. Only with ≥ 0.5 kWh electricity and > 90% coverage.",
+            "lifetime_*_delta (points 28392/28393) move in coarse steps and are not suitable for short buckets; their meaning is not validated.",
+            "The heat is NIBE's own estimate (flow × temperature difference), not an independent heat meter."
         ],
     }))
 }

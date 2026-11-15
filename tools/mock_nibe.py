@@ -59,6 +59,8 @@ def current():
     setv(28393, state["cons"] * 10)
     setv(27378, state["heat"] * 10)
     setv(27379, state["hw"] * 10)
+    setv(27382, state["heat"] * 10 * 1.05)
+    setv(27383, state["hw"] * 10 * 1.05)
     return out
 
 
