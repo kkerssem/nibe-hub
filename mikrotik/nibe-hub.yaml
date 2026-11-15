@@ -18,6 +18,10 @@
 # another bridge. For a VLAN on a vlan-filtering bridge, set the app property network-pvid
 # after /app/add and before /app/enable: /app/set nibe-hub network-pvid=<vlan-id>
 # (it is not a YAML field).
+#
+# Also set /app/set nibe-hub use-https=no before enabling: the MCP server does its own HTTPS,
+# and with the default use-https=yes the app waits for RouterOS's reverse proxy and never starts.
+# The image package on ghcr.io must be public; the app pulls without a registry login.
 
 name: nibe-hub
 descr: NIBE S735C heat pump history - collector and read-only MCP server
