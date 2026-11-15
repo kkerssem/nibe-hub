@@ -188,21 +188,25 @@ For that VLAN:
 
 2. **Pick the app's address.** The app's VETH gets its address from the DHCP server of the network (or VLAN) it is attached to. Choose a free address there and create the MCP certificate for it (as in [HTTPS for the MCP server](#https-for-the-mcp-server), with `subjectAltName=IP:<app-ip>`).
 
-3. **Generate the app definition** from your `.env` and the certificate:
+3. **Choose how the settings get into the app.** [mikrotik/nibe-hub.app.yaml](mikrotik/nibe-hub.app.yaml) is a complete app definition without secrets: the pump URL, user, password, fingerprint and MCP token are empty, and the two TLS configs hold a placeholder line. Either:
 
-   ```sh
-   python3 tools/make_app_yaml.py --cert cert.pem --key key.pem
-   ```
+   - **add it as it is** and fill in those values on the router before enabling the app. Until they are set, the services stop at startup with a message naming what is missing; or
+   - **generate a filled-in copy** from your `.env` and the certificate:
 
-   This writes `mikrotik/nibe-hub.app.local.yaml` (mode 0600, git-ignored). It contains the pump password, the MCP token and the TLS key, because RouterOS generates the values of app `secrets` itself and the documentation describes no way to supply your own. Each service gets only its own settings, as with `run_local.sh`. Add `--image ghcr.io/kkerssem/nibe-hub:<short-sha>` to pin a version instead of `latest`; each workflow run lists its tags in its summary.
+     ```sh
+     python3 tools/make_app_yaml.py --cert cert.pem --key key.pem
+     ```
 
-4. **Add the app on the router.** Upload the file, then:
+     This writes `mikrotik/nibe-hub.app.local.yaml` (mode 0600, git-ignored). It contains the pump password, the MCP token and the TLS key, because RouterOS generates the values of app `secrets` itself and the documentation describes no way to supply your own. Each service gets only its own settings, as with `run_local.sh`, and only the optional settings that are in `.env`. Add `--image ghcr.io/kkerssem/nibe-hub:<short-sha>` to pin a version instead of `latest`; each workflow run lists its tags in its summary.
+
+4. **Add the app on the router.** Upload the file (`nibe-hub.app.yaml` or `nibe-hub.app.local.yaml`), then:
 
    ```routeros
    /app/settings/set disk=usb1 lan-bridge=<your-bridge>
    /app/add yaml=[/file/get nibe-hub.app.local.yaml contents]
    # only for a VLAN on a vlan-filtering bridge; leave out for the untagged LAN (PVID 1)
    /app/set nibe-hub network-pvid=<vlan-id>
+   # with the file without secrets: fill in the empty values and the TLS configs here
    /app/enable nibe-hub
    /file/remove nibe-hub.app.local.yaml
    ```
@@ -219,7 +223,7 @@ For that VLAN:
 
    If the lease didn't get the address in your certificate, set it on the static lease (`address=<app-ip>`) and restart the app.
 
-### Why the file contains the secrets
+### Why the generated file contains the secrets
 
 App-level `secrets` take only a name (`mcp-token:`); RouterOS generates the value itself when the app runs and stores it under `<disk>/apps/<app>/secret-<name>`. Services reference it as `[secret:name]` in `environment` or read it from `/run/secrets/<name>`. The documentation describes no way to set or override the value, so:
 
@@ -238,6 +242,8 @@ Check these before relying on it:
 - that both services share one VETH, as the single `veth-app-<app>` name suggests
 - that `/app/set nibe-hub network-pvid=<vlan-id>` is accepted before enabling, and that the bridge port gets that PVID
 - that `command: /nibe-mcp` replaces the image's default command (`/nibe-collector`)
+- which parts of an added app can be edited on the router before enabling it: the environment values, and the contents of the `mcp-tls-cert` and `mcp-tls-key` configs (needed when adding the file without secrets)
+- that empty environment values (`NIBE_PASS: ""`) are accepted by `/app/add`
 
 ## The pump's TLS certificate
 
