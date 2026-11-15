@@ -157,6 +157,33 @@ pub fn aggregate(segs: &[Seg], b0: i64, b1: i64, agg: Agg, unit: &str) -> Option
     }
 }
 
+/// Increase of a cumulative counter over `[b0, b1]`, from the same boundary values as
+/// [`Agg::Delta`], but counting only rising steps. A drop is a reset of the counter (for
+/// example the pump's energy log cleared from its menu) and adds nothing, so a reset costs at
+/// most one poll's worth of increase instead of producing a large negative value.
+/// Returns the increase and whether a reset was seen; `None` without measured data.
+pub fn counter_increase(segs: &[Seg], b0: i64, b1: i64) -> Option<(f64, bool)> {
+    let st = stat(segs, b0, b1);
+    if st.covered_ms == 0 {
+        return None;
+    }
+    let mut prev = value_at(segs, b0).or(st.first)?;
+    let (mut increase, mut reset) = (0.0, false);
+    let first = segs.partition_point(|g| g.end <= b0);
+    for g in segs[first..].iter().take_while(|g| g.start <= b1) {
+        if g.start <= b0 {
+            continue;
+        }
+        if g.v >= prev {
+            increase += g.v - prev;
+        } else {
+            reset = true;
+        }
+        prev = g.v;
+    }
+    Some((increase, reset))
+}
+
 pub fn round(v: f64) -> f64 {
     if v.is_finite() {
         (v * 1000.0).round() / 1000.0
@@ -192,6 +219,20 @@ mod tests {
         let segs = build_segments(&samples, 0, 2000, 2000, &[]);
         assert!((aggregate(&segs, 0, 1000, Agg::Delta, "kWh").unwrap() - 0.4).abs() < 1e-9);
         assert!((aggregate(&segs, 1000, 2000, Agg::Delta, "kWh").unwrap() - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn counter_increase_skips_a_reset() {
+        // 100.0 -> 100.4, reset to 0.1, -> 0.3: increase 0.4 + 0.2, the drop adds nothing
+        let samples = [(0, Some(100.0)), (500, Some(100.4)), (1000, Some(0.1)), (1500, Some(0.3))];
+        let segs = build_segments(&samples, 0, 2000, 2000, &[]);
+        let (inc, reset) = counter_increase(&segs, 0, 2000).unwrap();
+        assert!((inc - 0.6).abs() < 1e-9 && reset, "{inc} {reset}");
+        // without a reset it equals Delta, including a step exactly at the bucket end
+        let (inc, reset) = counter_increase(&segs, 0, 500).unwrap();
+        assert!((inc - 0.4).abs() < 1e-9 && !reset);
+        assert_eq!(aggregate(&segs, 0, 500, Agg::Delta, "kWh"), Some(inc));
+        assert_eq!(counter_increase(&segs, 3000, 4000), None);
     }
 
     #[test]

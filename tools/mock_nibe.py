@@ -21,7 +21,20 @@ with gzip.open(args.data, "rt") as f:
     BASE = json.load(f)
 
 START = time.time()
-state = {"prod": 12144.7, "cons": 4043.0, "heat": 8740.0, "hw": 1239.1, "last": START}
+
+
+def dump_kwh(pid):
+    """A counter's value in the dump, in kWh (the counters are stored in 0.1 kWh)."""
+    return BASE[str(pid)]["value"]["integerValue"] / 10.0
+
+
+# Counters start at the dump's values and only advance, so the first request shows no jump.
+state = {
+    "prod": dump_kwh(28392), "cons": dump_kwh(28393),
+    "heat": dump_kwh(27378), "hw": dump_kwh(27379),          # compressor only
+    "heat_in": dump_kwh(27382), "hw_in": dump_kwh(27383),    # including additional heat
+    "last": START,
+}
 
 
 def sim_time():
@@ -42,6 +55,9 @@ def current():
     state["prod"] += unit_w / 1000.0 * dt * 3.2
     state["heat"] += unit_w / 1000.0 * dt * 3.0
     state["hw"] += unit_w / 1000.0 * dt * 0.2
+    # no additional heater runs in the mock, so the incl.-additional counters advance equally
+    state["heat_in"] += unit_w / 1000.0 * dt * 3.0
+    state["hw_in"] += unit_w / 1000.0 * dt * 0.2
     out = json.loads(json.dumps(BASE))
 
     def setv(pid, raw):
@@ -59,6 +75,8 @@ def current():
     setv(28393, state["cons"] * 10)
     setv(27378, state["heat"] * 10)
     setv(27379, state["hw"] * 10)
+    setv(27382, state["heat_in"] * 10)
+    setv(27383, state["hw_in"] * 10)
     return out
 
 
