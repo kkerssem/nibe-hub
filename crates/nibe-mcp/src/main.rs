@@ -12,7 +12,12 @@ use axum::{
     Router,
 };
 use rmcp::transport::streamable_http_server::{session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService};
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 use tools::NibeServer;
 use tracing::{info, warn};
 
@@ -48,8 +53,41 @@ fn env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.trim().is_empty())
 }
 
+/// `nibe-mcp health`, for a container health check: exit code 0 when the server accepts TCP
+/// connections on MCP_BIND's port (on localhost when MCP_BIND is 0.0.0.0 or [::]). A plain
+/// connect, so it needs neither the token nor the TLS certificate.
+fn health() -> i32 {
+    let bind: SocketAddr = match env("MCP_BIND").unwrap_or_else(|| "0.0.0.0:8080".into()).parse() {
+        Ok(b) => b,
+        Err(e) => {
+            println!("unhealthy: MCP_BIND: {e}");
+            return 1;
+        }
+    };
+    let target = match bind.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => SocketAddr::from((Ipv4Addr::LOCALHOST, bind.port())),
+        IpAddr::V6(ip) if ip.is_unspecified() => SocketAddr::from((Ipv6Addr::LOCALHOST, bind.port())),
+        _ => bind,
+    };
+    match std::net::TcpStream::connect_timeout(&target, Duration::from_secs(5)) {
+        Ok(_) => {
+            println!("healthy: {target} accepts connections");
+            0
+        }
+        Err(e) => {
+            println!("unhealthy: cannot connect to {target}: {e}");
+            1
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    match std::env::args().nth(1).as_deref() {
+        None => {}
+        Some("health") => std::process::exit(health()),
+        Some(other) => anyhow::bail!("unknown argument {other:?}: run without arguments, or with `health` for a health check"),
+    }
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();

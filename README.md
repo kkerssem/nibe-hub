@@ -244,6 +244,7 @@ Check these before relying on it:
 - that `command: /nibe-mcp` replaces the image's default command (`/nibe-collector`)
 - which parts of an added app can be edited on the router before enabling it: the environment values, and the contents of the `mcp-tls-cert` and `mcp-tls-key` configs (needed when adding the file without secrets)
 - that empty environment values (`NIBE_PASS: ""`) are accepted by `/app/add`
+- that the `healthcheck` of both services is accepted, and what RouterOS does when one fails: only show it, or restart the service
 
 ## The pump's TLS certificate
 
@@ -297,6 +298,15 @@ A self-refreshing dashboard artifact needs HTTPS on port 443 with a publicly tru
 | `MCP_BIND`, `MCP_ALLOWED_HOSTS`, `TZ_NAME` | 0.0.0.0:8080, off once a token is set, Europe/Amsterdam | |
 
 Both binaries stop cleanly on SIGTERM (what `container stop` and RouterOS send) as well as Ctrl-C.
+
+### Health checks
+
+The image has no shell, `wget` or `curl`, so each binary has a `health` subcommand for a container health check. It prints one line and exits with 0 (healthy) or 1:
+
+- `/nibe-collector health` reads the database (`DB_PATH`) and is healthy while the last successful full poll is at most three poll intervals plus 30 s old, the same rule as `healthy` in the MCP `status` tool. It catches an unreachable pump, a wrong password or a changed pump certificate, not only a stopped process. When unhealthy it also prints the last poll error.
+- `/nibe-mcp health` connects to the port in `MCP_BIND` (on localhost for `0.0.0.0`) and is healthy when the connection is accepted. It needs neither the token nor the certificate.
+
+[mikrotik/nibe-hub.yaml](mikrotik/nibe-hub.yaml) uses both as `healthcheck` (`test: ["CMD", "/nibe-collector", "health"]`). Locally: `container exec nibe /nibe-collector health`. The `/healthz` endpoint of the MCP server stays for checks from outside.
 
 ## Still to verify on the real pump
 

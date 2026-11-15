@@ -251,6 +251,24 @@ pub struct DbStats {
     pub poll_interval_secs: Option<i64>,
 }
 
+impl DbStats {
+    /// Seconds since the last successful full poll.
+    pub fn last_ok_poll_age_secs(&self, now_ms: i64) -> Option<i64> {
+        self.last_ok_poll_ms.map(|t| (now_ms - t) / 1000)
+    }
+
+    /// The collector counts as healthy while its last successful full poll is at most three poll
+    /// intervals (plus 30 s slack) old; without a recorded interval, 4 minutes. Used by the
+    /// `status` tool and by `nibe-collector health`.
+    pub fn collector_healthy(&self, now_ms: i64) -> bool {
+        match (self.last_ok_poll_age_secs(now_ms), self.poll_interval_secs) {
+            (Some(a), Some(i)) => a <= 3 * i + 30,
+            (Some(a), None) => a <= 240,
+            _ => false,
+        }
+    }
+}
+
 fn row_to_info(r: &rusqlite::Row<'_>) -> rusqlite::Result<PointInfo> {
     Ok(PointInfo {
         id: r.get(0)?,
@@ -410,5 +428,39 @@ impl Reader {
             last_poll_error: last_poll.and_then(|p| p.2),
             poll_interval_secs: self.meta("poll_interval_secs")?.and_then(|s| s.parse().ok()),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DbStats;
+
+    fn stats(last_ok_poll_ms: Option<i64>, poll_interval_secs: Option<i64>) -> DbStats {
+        DbStats {
+            points: 0,
+            samples: 0,
+            db_bytes: 0,
+            first_sample_ms: None,
+            last_sample_ms: None,
+            last_ok_poll_ms,
+            last_poll_ms: None,
+            last_poll_ok: None,
+            last_poll_error: None,
+            poll_interval_secs,
+        }
+    }
+
+    #[test]
+    fn collector_health() {
+        let now = 1_000_000_000;
+        // never polled successfully
+        assert!(!stats(None, Some(60)).collector_healthy(now));
+        // 60 s interval: healthy up to 3 * 60 + 30 = 210 s
+        assert!(stats(Some(now - 210_000), Some(60)).collector_healthy(now));
+        assert!(!stats(Some(now - 211_000), Some(60)).collector_healthy(now));
+        // no recorded interval: 240 s
+        assert!(stats(Some(now - 240_000), None).collector_healthy(now));
+        assert!(!stats(Some(now - 241_000), None).collector_healthy(now));
+        assert_eq!(stats(Some(now - 5_500), None).last_ok_poll_age_secs(now), Some(5));
     }
 }

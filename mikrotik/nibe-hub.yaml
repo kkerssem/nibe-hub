@@ -50,6 +50,14 @@ services:
     image: ghcr.io/kkerssem/nibe-hub:latest
     command: /nibe-collector
     restart: always
+    # healthy while the last successful poll of the pump is recent (at most 3 poll intervals);
+    # the image has no shell or wget, so the binary checks itself
+    healthcheck:
+      test: ["CMD", "/nibe-collector", "health"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
     volumes:
       - data:/data
     environment:
@@ -73,6 +81,13 @@ services:
     image: ghcr.io/kkerssem/nibe-hub:latest
     command: /nibe-mcp
     restart: always
+    # healthy while the server accepts connections on port 443
+    healthcheck:
+      test: ["CMD", "/nibe-mcp", "health"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     depends_on:
       - collector
     volumes:

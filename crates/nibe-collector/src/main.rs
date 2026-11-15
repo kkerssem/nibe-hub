@@ -296,8 +296,43 @@ async fn shutdown_signal() {
     }
 }
 
+/// `nibe-collector health`, for a container health check: exit code 0 while the last
+/// successful full poll in the database is recent (the same rule as `healthy` in the MCP
+/// `status` tool). Reads the database only, so it needs just DB_PATH, not the pump settings.
+fn health() -> i32 {
+    let db_path = env("DB_PATH").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/data/nibe.db"));
+    let stats = match nibe_core::db::Reader::open(&db_path).and_then(|r| r.stats()) {
+        Ok(s) => s,
+        Err(e) => {
+            println!("unhealthy: {e:#}");
+            return 1;
+        }
+    };
+    let now = now_ms();
+    let healthy = stats.collector_healthy(now);
+    let interval = stats.poll_interval_secs.map_or("unknown".to_string(), |i| format!("{i} s"));
+    match stats.last_ok_poll_age_secs(now) {
+        Some(age) => println!(
+            "{}: last successful poll {age} s ago, poll interval {interval}",
+            if healthy { "healthy" } else { "unhealthy" }
+        ),
+        None => println!("unhealthy: no successful poll yet"),
+    }
+    if !healthy {
+        if let Some(e) = &stats.last_poll_error {
+            println!("last poll error: {e}");
+        }
+    }
+    if healthy { 0 } else { 1 }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    match std::env::args().nth(1).as_deref() {
+        None => {}
+        Some("health") => std::process::exit(health()),
+        Some(other) => bail!("unknown argument {other:?}: run without arguments, or with `health` for a health check"),
+    }
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
