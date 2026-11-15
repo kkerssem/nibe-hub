@@ -6,10 +6,24 @@
 FROM rust:1-alpine AS build
 RUN apk add --no-cache musl-dev build-base
 WORKDIR /src
+
+# 1. Dependencies only. This layer depends on the manifests and Cargo.lock alone, so it is
+#    reused (locally, and from the GitHub Actions cache) until a dependency changes. No cache
+#    mounts here: the compiled dependencies in target/ must be part of the layer to be cached.
 COPY Cargo.toml Cargo.lock ./
+COPY crates/nibe-core/Cargo.toml crates/nibe-core/
+COPY crates/nibe-collector/Cargo.toml crates/nibe-collector/
+COPY crates/nibe-mcp/Cargo.toml crates/nibe-mcp/
+RUN mkdir -p crates/nibe-core/src crates/nibe-collector/src crates/nibe-mcp/src \
+ && touch crates/nibe-core/src/lib.rs \
+ && echo 'fn main() {}' > crates/nibe-collector/src/main.rs \
+ && echo 'fn main() {}' > crates/nibe-mcp/src/main.rs \
+ && cargo build --release --locked \
+ && rm -rf crates/*/src target/release/.fingerprint/nibe-* target/release/deps/*nibe_* target/release/nibe-*
+
+# 2. The workspace crates. A code change only rebuilds from here.
 COPY crates crates
-RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/src/target \
-    cargo build --release --locked \
+RUN cargo build --release --locked \
  && mkdir /out && cp target/release/nibe-collector target/release/nibe-mcp /out/
 
 FROM scratch
