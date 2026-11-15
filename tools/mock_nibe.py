@@ -6,7 +6,7 @@ a few points move, so the collector and MCP server have something to record.
 
     python3 tools/mock_nibe.py --port 8443 --user nibe --password secret
 """
-import argparse, base64, gzip, json, math, os, ssl, subprocess, tempfile, time
+import argparse, base64, gzip, hashlib, json, math, os, ssl, subprocess, tempfile, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ap = argparse.ArgumentParser()
@@ -107,5 +107,8 @@ srv = ThreadingHTTPServer(("0.0.0.0", args.port), H)
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 ctx.load_cert_chain(cert, key)
 srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+with open(cert) as f:
+    fingerprint = hashlib.sha256(ssl.PEM_cert_to_DER_cert(f.read())).hexdigest().upper()
 print(f"mock NIBE on https://0.0.0.0:{args.port} (user {args.user})", flush=True)
+print(f"NIBE_TLS_FINGERPRINT={':'.join(fingerprint[i:i + 2] for i in range(0, 64, 2))}", flush=True)
 srv.serve_forever()

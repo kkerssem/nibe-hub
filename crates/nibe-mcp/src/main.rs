@@ -12,7 +12,7 @@ use axum::{
     Router,
 };
 use rmcp::transport::streamable_http_server::{session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService};
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use tools::NibeServer;
 use tracing::{info, warn};
 
@@ -93,18 +93,62 @@ async fn main() -> Result<()> {
     }
     let service = StreamableHttpService::new(move || Ok(server.clone()), LocalSessionManager::default().into(), cfg);
 
+    let has_token = token.is_some();
     let auth = Auth { token: token.map(Arc::new) };
     let app = Router::new()
         .nest_service("/mcp", service)
         .layer(middleware::from_fn_with_state(auth, require_token))
         .route("/healthz", get(|| async { "ok" }));
 
-    let listener = tokio::net::TcpListener::bind(bind).await.with_context(|| format!("listening on {bind}"))?;
-    info!("MCP listening on http://{bind}/mcp");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await?;
+    // Stop on SIGINT or SIGTERM. Open MCP streams (SSE) would keep a graceful shutdown waiting
+    // forever, so connections get 5 seconds to finish.
+    let handle = axum_server::Handle::new();
+    {
+        let handle = handle.clone();
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            info!("stopping");
+            handle.graceful_shutdown(Some(Duration::from_secs(5)));
+        });
+    }
+    let make_service = app.into_make_service();
+    match (env("MCP_TLS_CERT"), env("MCP_TLS_KEY")) {
+        (Some(cert), Some(key)) => {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key)
+                .await
+                .with_context(|| format!("loading MCP_TLS_CERT {cert:?} and MCP_TLS_KEY {key:?}"))?;
+            info!("MCP listening on https://{bind}/mcp");
+            axum_server::bind_rustls(bind, tls).handle(handle).serve(make_service).await.with_context(|| format!("serving on {bind}"))?;
+        }
+        (None, None) => {
+            if has_token && !bind.ip().is_loopback() {
+                warn!("serving plain HTTP on {bind}: the bearer token is readable by anyone who can see the traffic; set MCP_TLS_CERT and MCP_TLS_KEY");
+            }
+            info!("MCP listening on http://{bind}/mcp");
+            axum_server::bind(bind).handle(handle).serve(make_service).await.with_context(|| format!("serving on {bind}"))?;
+        }
+        _ => anyhow::bail!("set both MCP_TLS_CERT and MCP_TLS_KEY, or neither"),
+    }
+    info!("stopped");
     Ok(())
+}
+
+/// Resolves on SIGINT or SIGTERM. Container runtimes stop with SIGTERM.
+async fn shutdown_signal() {
+    let term = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(e) => {
+                warn!("cannot listen for SIGTERM: {e}");
+                std::future::pending::<()>().await
+            }
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term => {}
+    }
 }

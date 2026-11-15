@@ -30,14 +30,34 @@ fn local_to_ms(naive: NaiveDateTime, tz: Tz) -> i64 {
     }
 }
 
+/// Earliest and latest accepted time: 1970-01-01 and 2100-01-01 (UTC). Anything outside is
+/// certainly a mistake, and the bound keeps all later date arithmetic far from overflow.
+pub const MIN_TIME_MS: i64 = 0;
+pub const MAX_TIME_MS: i64 = 4_102_444_800_000;
+
+fn check_range(ms: i64, s: &str) -> Result<i64> {
+    if !(MIN_TIME_MS..=MAX_TIME_MS).contains(&ms) {
+        bail!("time {s:?} is outside the supported range 1970-01-01 to 2100-01-01");
+    }
+    Ok(ms)
+}
+
+fn to_utc(ms: i64) -> Result<DateTime<Utc>> {
+    Utc.timestamp_millis_opt(ms).single().ok_or_else(|| anyhow!("time {ms} ms is out of range"))
+}
+
 /// Accepts: `now`, `today`, `yesterday`, relative (`-6h`, `-7d`, `-30m`, `-2w`),
 /// RFC 3339, `YYYY-MM-DD` (local midnight) and `YYYY-MM-DD HH:MM[:SS]` (local time).
+/// Times outside [`MIN_TIME_MS`, `MAX_TIME_MS`] are rejected.
 pub fn parse_time(s: &str, now: i64, tz: Tz) -> Result<i64> {
-    let s = s.trim();
+    check_range(parse_time_unchecked(s.trim(), now, tz)?, s)
+}
+
+fn parse_time_unchecked(s: &str, now: i64, tz: Tz) -> Result<i64> {
     match s.to_ascii_lowercase().as_str() {
         "now" => return Ok(now),
         "today" | "yesterday" => {
-            let local = Utc.timestamp_millis_opt(now).unwrap().with_timezone(&tz);
+            let local = to_utc(now)?.with_timezone(&tz);
             let mut d = local.date_naive();
             if s.eq_ignore_ascii_case("yesterday") {
                 d = d.pred_opt().unwrap();
@@ -58,7 +78,10 @@ pub fn parse_time(s: &str, now: i64, tz: Tz) -> Result<i64> {
                     'w' => 7 * 86_400_000,
                     _ => bail!("unknown unit in {s:?} (use s, m, h, d or w)"),
                 };
-                return Ok(now - n * ms);
+                return n
+                    .checked_mul(ms)
+                    .and_then(|d| now.checked_sub(d))
+                    .ok_or_else(|| anyhow!("time {s:?} is out of range"));
             }
         }
     }
@@ -132,12 +155,14 @@ pub fn bucket_edges(from: i64, to: i64, bucket: Bucket, tz: Tz) -> Result<Vec<(i
     if to <= from {
         bail!("`to` must be after `from`");
     }
+    check_range(from, "from")?;
+    check_range(to, "to")?;
     let mut out = Vec::new();
     match bucket {
         Bucket::Raw => bail!("raw has no buckets"),
         Bucket::Fixed(size) => {
             let off = tz
-                .offset_from_utc_datetime(&Utc.timestamp_millis_opt(from).unwrap().naive_utc())
+                .offset_from_utc_datetime(&to_utc(from)?.naive_utc())
                 .fix()
                 .local_minus_utc() as i64
                 * 1000;
@@ -151,7 +176,7 @@ pub fn bucket_edges(from: i64, to: i64, bucket: Bucket, tz: Tz) -> Result<Vec<(i
             }
         }
         Bucket::Day | Bucket::Week | Bucket::Month => {
-            let first = Utc.timestamp_millis_opt(from).unwrap().with_timezone(&tz).date_naive();
+            let first = to_utc(from)?.with_timezone(&tz).date_naive();
             let mut d = match bucket {
                 Bucket::Day => first,
                 Bucket::Week => first - Duration::days(first.weekday().num_days_from_monday() as i64),
@@ -202,5 +227,16 @@ mod tests {
         assert_eq!(parse_time("-6h", 10 * 3_600_000, tz).unwrap(), 4 * 3_600_000);
         assert!(parse_time("2026-11-15T10:00:00+01:00", 0, tz).is_ok());
         assert!(parse_time("nonsense", 0, tz).is_err());
+    }
+
+    #[test]
+    fn out_of_range_times_are_errors_not_panics() {
+        let tz = parse_tz("Europe/Amsterdam").unwrap();
+        let now = parse_time("2026-11-15", 0, tz).unwrap();
+        for s in ["-300000000d", "-9223372036854775807w", "-60y", "1900-01-01", "9999-12-31", "2200-01-01T00:00:00Z"] {
+            assert!(parse_time(s, now, tz).is_err(), "{s} should be rejected");
+        }
+        assert!(bucket_edges(-1_000_000_000_000_000, now, Bucket::Day, tz).is_err());
+        assert!(bucket_edges(i64::MIN, now, Bucket::Fixed(3_600_000), tz).is_err());
     }
 }

@@ -37,7 +37,7 @@ pub fn coverage(reader: &Reader, from: i64, to: i64) -> Result<Coverage> {
 
 pub fn segments(reader: &Reader, info: &PointInfo, from: i64, to: i64, cov: &Coverage) -> Result<Vec<Seg>> {
     let samples: Vec<(i64, Option<f64>)> = reader
-        .samples(info.id, from, to)?
+        .samples(info.id, from, to, None)?
         .into_iter()
         .map(|(t, r)| (t, r.map(|r| info.scale(r))))
         .collect();
@@ -73,14 +73,18 @@ pub fn series_table(reader: &Reader, tz: Tz, ids: &[i64], from: i64, to: i64, bu
     let cov = coverage(reader, from, to)?;
 
     if bucket == Bucket::Raw {
+        // Each point gets an equal share of the row budget, and the limit is applied in SQL,
+        // so a long range never loads more than the rows it returns.
+        let per_point = MAX_RAW_ROWS / infos.len();
         let mut rows = Vec::new();
-        let mut truncated = false;
+        let mut truncated = Vec::new();
         for info in &infos {
-            for (i, (t, raw)) in reader.samples(info.id, from, to)?.into_iter().enumerate() {
-                if rows.len() >= MAX_RAW_ROWS {
-                    truncated = true;
-                    break;
-                }
+            let mut samples = reader.samples(info.id, from, to, Some(per_point + 1))?;
+            if samples.len() > per_point {
+                samples.truncate(per_point);
+                truncated.push(info.id);
+            }
+            for (i, (t, raw)) in samples.into_iter().enumerate() {
                 let t = if i == 0 && t < from { from } else { t };
                 rows.push(json!([fmt_ts(t, tz), info.id, raw.map(|r| round(info.scale(r)))]));
             }
@@ -88,9 +92,9 @@ pub fn series_table(reader: &Reader, tz: Tz, ids: &[i64], from: i64, to: i64, bu
         return Ok(json!({
             "timezone": tz.name(), "bucket": "raw", "series": legend,
             "columns": ["time", "id", "value"], "rows": rows,
-            "notes": if truncated {
-                vec![format!("truncated at {MAX_RAW_ROWS} rows; choose a shorter range or a bucket")]
-            } else { vec![] },
+            "notes": if truncated.is_empty() { vec![] } else {
+                vec![format!("points {truncated:?} truncated at {per_point} rows each (the first rows of the range); choose a shorter range or a bucket")]
+            },
         }));
     }
 

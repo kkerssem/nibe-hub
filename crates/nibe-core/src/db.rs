@@ -68,9 +68,15 @@ impl PointInfo {
 
 // ---------------------------------------------------------------- writer
 
+/// Sample statistics kept in `meta` by the writer, so the readers never have to scan `samples`.
+const META_SAMPLES: &str = "samples_count";
+const META_FIRST: &str = "first_sample_ms";
+const META_LAST: &str = "last_sample_ms";
+
 pub struct Store {
     conn: Connection,
-    last: HashMap<i64, Option<i64>>,
+    /// Latest stored sample per point: (timestamp, raw value).
+    last: HashMap<i64, (i64, Option<i64>)>,
 }
 
 impl Store {
@@ -85,14 +91,28 @@ impl Store {
         conn.execute_batch(SCHEMA)?;
         let mut last = HashMap::new();
         {
-            let mut stmt = conn.prepare(
-                "SELECT s.point_id, s.raw FROM samples s
-                 WHERE s.ts_ms = (SELECT MAX(ts_ms) FROM samples WHERE point_id = s.point_id)",
-            )?;
-            let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?)))?;
-            for r in rows {
-                let (id, raw) = r?;
-                last.insert(id, raw);
+            // One index seek per catalogue point instead of a scan of the whole samples table.
+            let ids: Vec<i64> = conn.prepare("SELECT id FROM points")?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+            let mut latest = conn.prepare("SELECT ts_ms, raw FROM samples WHERE point_id = ?1 ORDER BY ts_ms DESC LIMIT 1")?;
+            for id in ids {
+                if let Some(v) = latest.query_row(params![id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?))).optional()? {
+                    last.insert(id, v);
+                }
+            }
+        }
+        // Databases from before the counters were kept get them once (a one-time scan).
+        let has_counters: bool =
+            conn.query_row("SELECT EXISTS(SELECT 1 FROM meta WHERE key = ?1)", params![META_SAMPLES], |r| r.get(0))?;
+        if !has_counters {
+            let (n, first, lastts): (i64, Option<i64>, Option<i64>) =
+                conn.query_row("SELECT COUNT(*), MIN(ts_ms), MAX(ts_ms) FROM samples", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            let set = |k: &str, v: i64| conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?1, ?2)", params![k, v.to_string()]);
+            set(META_SAMPLES, n)?;
+            if let Some(f) = first {
+                set(META_FIRST, f)?;
+            }
+            if let Some(l) = lastts {
+                set(META_LAST, l)?;
             }
         }
         Ok(Self { conn, last })
@@ -149,21 +169,45 @@ impl Store {
     }
 
     /// Stores only values that changed. Returns the number of new samples.
+    ///
+    /// A value older than (or as old as) the point's latest stored sample is ignored, so a
+    /// slow full poll can never overwrite a newer fast-poll value. The in-memory cache is
+    /// updated only after the transaction commits, so a failed write is retried next time.
     pub fn record(&mut self, ts_ms: i64, values: &[(i64, Option<i64>)]) -> Result<usize> {
-        let tx = self.conn.transaction()?;
-        let mut changed = 0;
-        {
-            let mut st = tx.prepare_cached("INSERT OR REPLACE INTO samples(point_id, ts_ms, raw) VALUES (?1,?2,?3)")?;
-            for (id, raw) in values {
-                if self.last.get(id) == Some(raw) {
-                    continue;
-                }
-                st.execute(params![id, ts_ms, raw])?;
-                self.last.insert(*id, *raw);
-                changed += 1;
+        let mut pending = Vec::new();
+        for (id, raw) in values {
+            match self.last.get(id) {
+                Some((t, _)) if *t >= ts_ms => continue,
+                Some((_, v)) if v == raw => continue,
+                _ => pending.push((*id, *raw)),
             }
         }
+        if pending.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.transaction()?;
+        {
+            let mut st = tx.prepare_cached("INSERT INTO samples(point_id, ts_ms, raw) VALUES (?1,?2,?3)")?;
+            for (id, raw) in &pending {
+                st.execute(params![id, ts_ms, raw])?;
+            }
+            tx.execute(
+                "INSERT INTO meta(key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + CAST(excluded.value AS INTEGER)",
+                params![META_SAMPLES, pending.len().to_string()],
+            )?;
+            tx.execute("INSERT OR IGNORE INTO meta(key, value) VALUES (?1, ?2)", params![META_FIRST, ts_ms.to_string()])?;
+            tx.execute(
+                "INSERT INTO meta(key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = MAX(CAST(value AS INTEGER), CAST(excluded.value AS INTEGER))",
+                params![META_LAST, ts_ms.to_string()],
+            )?;
+        }
         tx.commit()?;
+        let changed = pending.len();
+        for (id, raw) in pending {
+            self.last.insert(id, (ts_ms, raw));
+        }
         Ok(changed)
     }
 
@@ -178,8 +222,12 @@ impl Store {
         }
     }
 
+    /// Deletes old failed polls and fast-poll entries. Successful full polls are kept for as
+    /// long as the samples: gap detection needs them for every range that can be queried.
     pub fn prune_polls(&self, older_than_ms: i64) -> Result<usize> {
-        Ok(self.conn.execute("DELETE FROM polls WHERE ts_ms < ?1", params![older_than_ms])?)
+        Ok(self
+            .conn
+            .execute("DELETE FROM polls WHERE ts_ms < ?1 AND (ok = 0 OR kind != 'full')", params![older_than_ms])?)
     }
 }
 
@@ -279,8 +327,9 @@ impl Reader {
             .optional()?)
     }
 
-    /// The sample in effect at `from` (baseline) plus all samples in `(from, to)`.
-    pub fn samples(&self, id: i64, from: i64, to: i64) -> Result<Vec<(i64, Option<i64>)>> {
+    /// The sample in effect at `from` (baseline) plus the samples in `(from, to)`, at most
+    /// `limit` of them in total when a limit is given.
+    pub fn samples(&self, id: i64, from: i64, to: i64, limit: Option<usize>) -> Result<Vec<(i64, Option<i64>)>> {
         let mut out = Vec::new();
         if let Some(b) = self
             .conn
@@ -293,10 +342,12 @@ impl Reader {
         {
             out.push(b);
         }
-        let mut st = self
-            .conn
-            .prepare_cached("SELECT ts_ms, raw FROM samples WHERE point_id = ?1 AND ts_ms > ?2 AND ts_ms < ?3 ORDER BY ts_ms")?;
-        let rows = st.query_map(params![id, from, to], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?)))?;
+        // LIMIT -1 means no limit in SQLite
+        let rest = limit.map(|l| l.saturating_sub(out.len()) as i64).unwrap_or(-1);
+        let mut st = self.conn.prepare_cached(
+            "SELECT ts_ms, raw FROM samples WHERE point_id = ?1 AND ts_ms > ?2 AND ts_ms < ?3 ORDER BY ts_ms LIMIT ?4",
+        )?;
+        let rows = st.query_map(params![id, from, to, rest], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?)))?;
         for r in rows {
             out.push(r?);
         }
@@ -326,9 +377,21 @@ impl Reader {
         Ok(out)
     }
 
+    /// Time of the latest successful full poll (walks the polls primary key backwards).
+    pub fn last_ok_poll_ms(&self) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row("SELECT ts_ms FROM polls WHERE kind='full' AND ok=1 ORDER BY ts_ms DESC LIMIT 1", [], |r| r.get(0))
+            .optional()?)
+    }
+
+    fn meta_i64(&self, key: &str) -> Result<Option<i64>> {
+        Ok(self.meta(key)?.and_then(|s| s.parse().ok()))
+    }
+
+    /// Cheap statistics: sample counts and range come from `meta`, which the writer maintains.
     pub fn stats(&self) -> Result<DbStats> {
         let one = |sql: &str| -> Result<i64> { Ok(self.conn.query_row(sql, [], |r| r.get(0))?) };
-        let opt = |sql: &str| -> Result<Option<i64>> { Ok(self.conn.query_row(sql, [], |r| r.get(0))?) };
         let last_poll: Option<(i64, bool, Option<String>)> = self
             .conn
             .query_row("SELECT ts_ms, ok, error FROM polls ORDER BY ts_ms DESC LIMIT 1", [], |r| {
@@ -337,11 +400,11 @@ impl Reader {
             .optional()?;
         Ok(DbStats {
             points: one("SELECT COUNT(*) FROM points")?,
-            samples: one("SELECT COUNT(*) FROM samples")?,
+            samples: self.meta_i64(META_SAMPLES)?.unwrap_or(0),
             db_bytes: one("SELECT page_count * page_size FROM pragma_page_count, pragma_page_size")?,
-            first_sample_ms: opt("SELECT MIN(ts_ms) FROM samples")?,
-            last_sample_ms: opt("SELECT MAX(ts_ms) FROM samples")?,
-            last_ok_poll_ms: opt("SELECT MAX(ts_ms) FROM polls WHERE kind='full' AND ok=1")?,
+            first_sample_ms: self.meta_i64(META_FIRST)?,
+            last_sample_ms: self.meta_i64(META_LAST)?,
+            last_ok_poll_ms: self.last_ok_poll_ms()?,
             last_poll_ms: last_poll.as_ref().map(|p| p.0),
             last_poll_ok: last_poll.as_ref().map(|p| p.1),
             last_poll_error: last_poll.and_then(|p| p.2),

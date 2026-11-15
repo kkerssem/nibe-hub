@@ -163,7 +163,7 @@ impl NibeServer {
                 (_, Some(q)) => r.search(Some(&q), None, 40)?,
                 _ => anyhow::bail!("give `ids` or `search`"),
             };
-            let stats = r.stats()?;
+            let last_ok_poll = r.last_ok_poll_ms()?;
             let values: Vec<Value> = infos
                 .iter()
                 .map(|p| {
@@ -175,7 +175,7 @@ impl NibeServer {
                     })
                 })
                 .collect();
-            Ok(json!({"data_as_of": stats.last_ok_poll_ms.map(|t| fmt_ts(t, tz)), "values": values}))
+            Ok(json!({"data_as_of": last_ok_poll.map(|t| fmt_ts(t, tz)), "values": values}))
         })
         .await
     }

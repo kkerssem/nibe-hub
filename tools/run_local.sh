@@ -20,18 +20,31 @@ PORT=${PORT:-127.0.0.1:8080}
 
 exists() { container inspect "$NAME" >/dev/null 2>&1; }
 
+# Each process gets only its own settings from $ENV_FILE: the collector never sees MCP_TOKEN
+# and the MCP server never sees the pump password.
+COLLECTOR_VARS='^(NIBE_[A-Z_]+|DB_PATH|RUST_LOG)='
+MCP_VARS='^(MCP_[A-Z_]+|DB_PATH|TZ_NAME|RUST_LOG)='
+
+split_env() {
+    TMP=$(mktemp -d)
+    trap 'rm -rf "$TMP"' EXIT
+    grep -E "$COLLECTOR_VARS" "$ENV_FILE" > "$TMP/collector.env" || true
+    grep -E "$MCP_VARS" "$ENV_FILE" > "$TMP/mcp.env" || true
+}
+
 case "${1:-}" in
 up)
     [ -f "$ENV_FILE" ] || { echo "missing $ENV_FILE (see README)" >&2; exit 1; }
+    split_env
     container volume inspect "$VOLUME" >/dev/null 2>&1 || container volume create "$VOLUME" >/dev/null
     if exists; then
+        # recreate, so changes to $ENV_FILE take effect
         container stop "$NAME" >/dev/null 2>&1 || true
-        container start "$NAME" >/dev/null
-    else
-        container run -d --name "$NAME" --env-file "$ENV_FILE" -v "$VOLUME:/data" -p "$PORT:8080" \
-            --entrypoint /nibe-collector "$IMAGE" >/dev/null
+        container rm "$NAME" >/dev/null
     fi
-    container exec -d --env-file "$ENV_FILE" "$NAME" /nibe-mcp
+    container run -d --name "$NAME" --env-file "$TMP/collector.env" -v "$VOLUME:/data" -p "$PORT:8080" \
+        --entrypoint /nibe-collector "$IMAGE" >/dev/null
+    container exec -d --env-file "$TMP/mcp.env" "$NAME" /nibe-mcp
     echo "collector running in '$NAME'; MCP on http://$PORT/mcp"
     ;;
 down)

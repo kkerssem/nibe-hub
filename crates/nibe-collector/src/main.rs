@@ -1,6 +1,8 @@
 //! Periodically fetches all data points from the local NIBE REST API and writes the
 //! changes to SQLite. GET requests only; nothing on the heat pump is ever changed.
 
+mod tls;
+
 use anyhow::{anyhow, bail, Context, Result};
 use nibe_core::api::{normalize_raw, parse_point_response, parse_points, ApiPoint};
 use nibe_core::db::Store;
@@ -11,12 +13,22 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 
+/// How the pump's TLS certificate is checked.
+enum TlsMode {
+    /// Normal CA verification (for a pump behind a proxy with a real certificate).
+    Verify,
+    /// Accept only the certificate with this SHA-256 fingerprint.
+    Pinned([u8; 32]),
+    /// No verification at all (`NIBE_INSECURE_TLS=true`).
+    Insecure,
+}
+
 struct Config {
     base_url: String,
     user: String,
     pass: String,
     device: u32,
-    insecure_tls: bool,
+    tls: TlsMode,
     poll: Duration,
     fast_ids: Vec<i64>,
     fast: Duration,
@@ -40,12 +52,23 @@ impl Config {
             .transpose()
             .context("NIBE_FAST_IDS must be a comma-separated list of point ids")?
             .unwrap_or_default();
+        let insecure = env("NIBE_INSECURE_TLS").map(|v| v == "true" || v == "1").unwrap_or(false);
+        let tls = match env("NIBE_TLS_FINGERPRINT") {
+            Some(fp) => {
+                if insecure {
+                    bail!("set either NIBE_TLS_FINGERPRINT or NIBE_INSECURE_TLS, not both");
+                }
+                TlsMode::Pinned(tls::parse_fingerprint(&fp)?)
+            }
+            None if insecure => TlsMode::Insecure,
+            None => TlsMode::Verify,
+        };
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             user: env("NIBE_USER").ok_or_else(|| anyhow!("NIBE_USER is missing"))?,
             pass: env("NIBE_PASS").ok_or_else(|| anyhow!("NIBE_PASS is missing"))?,
             device: env("NIBE_DEVICE").map(|v| v.parse()).transpose()?.unwrap_or(0),
-            insecure_tls: env("NIBE_INSECURE_TLS").map(|v| v != "false" && v != "0").unwrap_or(true),
+            tls,
             poll: Duration::from_secs(poll),
             fast_ids,
             fast: Duration::from_secs(fast),
@@ -100,7 +123,7 @@ fn writer_thread(mut store: Store, mut rx: mpsc::Receiver<Msg>, poll_secs: u64) 
         let now = now_ms();
         if now - last_prune > 86_400_000 {
             last_prune = now;
-            // the poll log is only used for gap detection; 90 days is plenty
+            // successful full polls are kept (gap detection needs them); failures go after 90 days
             if let Err(e) = store.prune_polls(now - 90 * 86_400_000) {
                 warn!("pruning poll log failed: {e:#}");
             }
@@ -110,14 +133,17 @@ fn writer_thread(mut store: Store, mut rx: mpsc::Receiver<Msg>, poll_secs: u64) 
 }
 
 fn build_client(cfg: &Config) -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .danger_accept_invalid_certs(cfg.insecure_tls)
+    let builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
         .connect_timeout(Duration::from_secs(8))
         .pool_idle_timeout(Duration::from_secs(30))
-        .user_agent("nibe-collector/0.1")
-        .build()
-        .context("building HTTP client")
+        .user_agent("nibe-collector/0.1");
+    let builder = match &cfg.tls {
+        TlsMode::Verify => builder,
+        TlsMode::Pinned(fp) => builder.tls_backend_preconfigured(tls::pinned_client_config(*fp)?),
+        TlsMode::Insecure => builder.danger_accept_invalid_certs(true),
+    };
+    builder.build().context("building HTTP client")
 }
 
 async fn get(client: &reqwest::Client, cfg: &Config, path: &str) -> Result<Vec<u8>> {
@@ -136,14 +162,16 @@ fn to_values(pts: &BTreeMap<i64, ApiPoint>) -> Vec<(i64, Option<i64>)> {
 
 async fn full_poll(client: &reqwest::Client, cfg: &Config, tx: &mpsc::Sender<Msg>, first: bool) -> Result<(usize, usize)> {
     let t0 = Instant::now();
-    let ts_ms = now_ms();
     let body = match get(client, cfg, "/points").await {
         Ok(b) => b,
         Err(e) => {
-            let _ = tx.send(Msg::Failure { ts_ms, kind: "full", duration_ms: t0.elapsed().as_millis() as i64, error: format!("{e:#}") }).await;
+            let _ = tx.send(Msg::Failure { ts_ms: now_ms(), kind: "full", duration_ms: t0.elapsed().as_millis() as i64, error: format!("{e:#}") }).await;
             return Err(e);
         }
     };
+    // Stamp the values when they arrived, not when the request was sent: a fast poll that
+    // completed in the meantime then stays older than this one.
+    let ts_ms = now_ms();
     let pts = match parse_points(&body) {
         Ok(p) => p,
         Err(e) => {
@@ -170,7 +198,6 @@ async fn fast_loop(client: reqwest::Client, cfg: std::sync::Arc<Config>, tx: mps
     let mut fails = 0u32;
     loop {
         tick.tick().await;
-        let ts_ms = now_ms();
         let t0 = Instant::now();
         let mut values = Vec::new();
         let mut err = None;
@@ -187,6 +214,7 @@ async fn fast_loop(client: reqwest::Client, cfg: std::sync::Arc<Config>, tx: mps
                 }
             }
         }
+        let ts_ms = now_ms();
         if let Some(e) = err {
             fails += 1;
             if fails == 1 || fails % 30 == 0 {
@@ -205,6 +233,26 @@ async fn fast_loop(client: reqwest::Client, cfg: std::sync::Arc<Config>, tx: mps
     }
 }
 
+/// Resolves on SIGINT or SIGTERM. Container runtimes stop with SIGTERM, which PID 1 would
+/// otherwise ignore.
+async fn shutdown_signal() {
+    let term = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(e) => {
+                warn!("cannot listen for SIGTERM: {e}");
+                std::future::pending::<()>().await
+            }
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term => {}
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -214,8 +262,10 @@ async fn main() -> Result<()> {
 
     let cfg = std::sync::Arc::new(Config::from_env()?);
     info!("NIBE {} (device {}), poll {}s, db {:?}", cfg.base_url, cfg.device, cfg.poll.as_secs(), cfg.db_path);
-    if cfg.insecure_tls {
-        info!("TLS certificate is not verified (the pump uses a self-signed certificate)");
+    match &cfg.tls {
+        TlsMode::Verify => info!("TLS certificate is verified against the system CAs; set NIBE_TLS_FINGERPRINT for the pump's self-signed certificate"),
+        TlsMode::Pinned(fp) => info!("TLS certificate pinned to SHA-256 {}", tls::fmt_fingerprint(fp)),
+        TlsMode::Insecure => warn!("TLS certificate is NOT verified (NIBE_INSECURE_TLS); the pump password goes to whoever answers at NIBE_URL"),
     }
     let store = Store::open(&cfg.db_path)?;
     let (tx, rx) = mpsc::channel::<Msg>(64);
@@ -226,10 +276,10 @@ async fn main() -> Result<()> {
     let mut tick = tokio::time::interval(cfg.poll);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut first = true;
-    let mut fast_started = false;
+    let mut fast_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut fails = 0u32;
     let mut last_catalog = Instant::now();
-    let shutdown = tokio::signal::ctrl_c();
+    let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
 
     loop {
@@ -238,7 +288,11 @@ async fn main() -> Result<()> {
             _ = &mut shutdown => { info!("stopping"); break; }
         }
         let refresh_catalog = first || last_catalog.elapsed() > Duration::from_secs(86_400);
-        match full_poll(&client, &cfg, &tx, refresh_catalog).await {
+        let result = tokio::select! {
+            r = full_poll(&client, &cfg, &tx, refresh_catalog) => r,
+            _ = &mut shutdown => { info!("stopping"); break; }
+        };
+        match result {
             Ok((n, changed)) => {
                 if fails > 0 {
                     info!("connection restored after {fails} failed polls");
@@ -253,21 +307,30 @@ async fn main() -> Result<()> {
                     tracing::debug!("{n} points, {changed} changed");
                 }
                 first = false;
-                if !fast_started && !cfg.fast_ids.is_empty() {
-                    fast_started = true;
+                if fast_task.is_none() && !cfg.fast_ids.is_empty() {
                     info!("fast poll for {:?} every {}s", cfg.fast_ids, cfg.fast.as_secs());
-                    tokio::spawn(fast_loop(client.clone(), cfg.clone(), tx.clone()));
+                    fast_task = Some(tokio::spawn(fast_loop(client.clone(), cfg.clone(), tx.clone())));
                 }
             }
             Err(e) => {
                 fails += 1;
                 if fails == 1 || fails % 10 == 0 {
                     warn!("poll failed ({fails}x in a row): {e:#}");
+                    if fails == 1 && matches!(cfg.tls, TlsMode::Verify) && format!("{e:#}").to_lowercase().contains("certificate") {
+                        warn!("the pump uses a self-signed certificate: set NIBE_TLS_FINGERPRINT (see README)");
+                    }
                 }
             }
         }
     }
+    // The fast-poll task holds a sender; stop it so the writer sees the channel close and
+    // finishes the pending writes.
+    if let Some(t) = fast_task {
+        t.abort();
+        let _ = t.await;
+    }
     drop(tx);
-    let _ = writer.join();
+    let _ = tokio::task::spawn_blocking(move || writer.join()).await;
+    info!("stopped");
     Ok(())
 }
