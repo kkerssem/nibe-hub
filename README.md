@@ -282,16 +282,26 @@ An empty `NIBE_TLS_FINGERPRINT=` line is an error rather than "not set", so a te
 
 ## Claude Desktop
 
+In `~/Library/Application Support/Claude/claude_desktop_config.json`, under `mcpServers`:
+
 ```json
 "nibe": {
   "command": "/opt/homebrew/bin/npx",
-  "args": ["mcp-remote", "https://<router-ip>:8080/mcp",
-           "--header", "Authorization: Bearer <MCP_TOKEN>"],
-  "env": { "NODE_EXTRA_CA_CERTS": "/path/to/cert.pem" }
+  "args": ["-y", "mcp-remote", "https://<app-ip>/mcp",
+           "--header", "Authorization:${NIBE_AUTH}"],
+  "env": {
+    "NIBE_AUTH": "Bearer <MCP_TOKEN>",
+    "NODE_EXTRA_CA_CERTS": "/path/to/cert.pem"
+  }
 }
 ```
 
-Use `https://<app-ip>/mcp` (port 443) for the MikroTik App. `NODE_EXTRA_CA_CERTS` makes `mcp-remote` trust the self-signed certificate. For the local Apple container, use `http://127.0.0.1:8080/mcp` with `--allow-http` and no `env`; that traffic never leaves the Mac.
+- **URL:** `https://<app-ip>/mcp` (port 443) for the MikroTik App; `https://<router-ip>:8080/mcp` for the `/container` setup.
+- **Token:** `mcp-remote` fills in `${NIBE_AUTH}` from `env`, so the token doesn't appear on the command line (or in a process list). It is still stored in the config file, so keep that file private (mode 600).
+- **Certificate:** `NODE_EXTRA_CA_CERTS` makes `mcp-remote` trust the self-signed certificate.
+- **Local Apple container:** use `http://127.0.0.1:8080/mcp` with `--allow-http` and no `NODE_EXTRA_CA_CERTS`; that traffic never leaves the Mac.
+
+Restart Claude Desktop (Cmd-Q) to load it. Away from home, the server is only reachable over a VPN into its network.
 
 A self-refreshing dashboard artifact needs HTTPS on port 443 with a publicly trusted certificate (a reverse proxy or tunnel); that is not built in here.
 
