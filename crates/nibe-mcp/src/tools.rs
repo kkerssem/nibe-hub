@@ -98,8 +98,9 @@ impl NibeServer {
     async fn status(&self) -> Result<CallToolResult, McpError> {
         self.run(|r, tz, now| {
             let s = r.stats()?;
-            let age = s.last_ok_poll_age_secs(now);
-            let healthy = s.collector_healthy(now);
+            let h = s.health();
+            let age = h.last_ok_poll_age_secs(now);
+            let healthy = h.is_healthy(now);
             Ok(json!({
                 "healthy": healthy,
                 "timezone": tz.name(),

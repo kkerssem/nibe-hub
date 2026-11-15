@@ -13,11 +13,12 @@ use axum::{
 };
 use rmcp::transport::streamable_http_server::{session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService};
 use std::{
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    path::PathBuf,
+    io::{Read, Write},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream},
     sync::Arc,
     time::Duration,
 };
+use nibe_core::config::env;
 use tools::NibeServer;
 use tracing::{info, warn};
 
@@ -49,13 +50,83 @@ async fn require_token(State(auth): State<Auth>, req: Request, next: Next) -> Re
     next.run(req).await
 }
 
-fn env(key: &str) -> Option<String> {
-    std::env::var(key).ok().filter(|v| !v.trim().is_empty())
+/// Accepts any server certificate. Only for `nibe-mcp health`, which talks to its own server on
+/// localhost and checks that it answers, not who it is.
+#[derive(Debug)]
+struct AnyServerCert(Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for AnyServerCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
 }
 
-/// `nibe-mcp health`, for a container health check: exit code 0 when the server accepts TCP
-/// connections on MCP_BIND's port (on localhost when MCP_BIND is 0.0.0.0 or [::]). A plain
-/// connect, so it needs neither the token nor the TLS certificate.
+/// Sends `GET /healthz` to `target` (over TLS when `tls`) and returns the response.
+fn get_healthz(target: SocketAddr, tls: bool) -> Result<String> {
+    const TIMEOUT: Duration = Duration::from_secs(3);
+    let tcp = TcpStream::connect_timeout(&target, TIMEOUT).context("connecting")?;
+    tcp.set_read_timeout(Some(TIMEOUT))?;
+    tcp.set_write_timeout(Some(TIMEOUT))?;
+    let request = b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    let mut response = Vec::new();
+    // A read error after the response arrived (a TLS peer that closes without close_notify)
+    // doesn't matter: only what was received counts.
+    let read_result = if tls {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let config = rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()?
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AnyServerCert(provider)))
+            .with_no_client_auth();
+        let name = rustls::pki_types::ServerName::IpAddress(target.ip().into());
+        let conn = rustls::ClientConnection::new(Arc::new(config), name)?;
+        let mut stream = rustls::StreamOwned::new(conn, tcp);
+        stream.write_all(request).context("sending the request over TLS")?;
+        stream.read_to_end(&mut response)
+    } else {
+        let mut stream = tcp;
+        stream.write_all(request).context("sending the request")?;
+        stream.read_to_end(&mut response)
+    };
+    if response.is_empty() {
+        read_result.context("reading the response")?;
+    }
+    Ok(String::from_utf8_lossy(&response).into_owned())
+}
+
+/// `nibe-mcp health`, for a container health check: exit code 0 when `GET /healthz` on the
+/// port in MCP_BIND answers `200 ok`, over HTTPS when MCP_TLS_CERT is set (the certificate is
+/// not checked: only whether the server answers matters). For a 0.0.0.0 or [::] bind it asks
+/// localhost, trying 127.0.0.1 too for [::]. Needs neither the token nor the certificate.
 fn health() -> i32 {
     let bind: SocketAddr = match env("MCP_BIND").unwrap_or_else(|| "0.0.0.0:8080".into()).parse() {
         Ok(b) => b,
@@ -64,35 +135,39 @@ fn health() -> i32 {
             return 1;
         }
     };
-    let target = match bind.ip() {
-        IpAddr::V4(ip) if ip.is_unspecified() => SocketAddr::from((Ipv4Addr::LOCALHOST, bind.port())),
-        IpAddr::V6(ip) if ip.is_unspecified() => SocketAddr::from((Ipv6Addr::LOCALHOST, bind.port())),
-        _ => bind,
+    let port = bind.port();
+    let targets: Vec<SocketAddr> = match bind.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => vec![(Ipv4Addr::LOCALHOST, port).into()],
+        IpAddr::V6(ip) if ip.is_unspecified() => vec![(Ipv6Addr::LOCALHOST, port).into(), (Ipv4Addr::LOCALHOST, port).into()],
+        _ => vec![bind],
     };
-    match std::net::TcpStream::connect_timeout(&target, Duration::from_secs(5)) {
-        Ok(_) => {
-            println!("healthy: {target} accepts connections");
-            0
-        }
-        Err(e) => {
-            println!("unhealthy: cannot connect to {target}: {e}");
-            1
+    let tls = env("MCP_TLS_CERT").is_some();
+    let scheme = if tls { "https" } else { "http" };
+    let mut problems = Vec::new();
+    for target in targets {
+        match get_healthz(target, tls) {
+            Ok(r) if r.starts_with("HTTP/1.1 200") && r.trim_end().ends_with("ok") => {
+                println!("healthy: {scheme}://{target}/healthz answers ok");
+                return 0;
+            }
+            Ok(r) => problems.push(format!("{target}: unexpected answer {:?}", r.lines().next().unwrap_or(""))),
+            Err(e) => problems.push(format!("{target}: {e:#}")),
         }
     }
+    println!("unhealthy: {scheme} /healthz: {}", problems.join("; "));
+    1
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    match std::env::args().nth(1).as_deref() {
-        None => {}
-        Some("health") => std::process::exit(health()),
-        Some(other) => anyhow::bail!("unknown argument {other:?}: run without arguments, or with `health` for a health check"),
+    if nibe_core::config::health_requested() {
+        std::process::exit(health());
     }
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
 
-    let db_path = env("DB_PATH").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/data/nibe.db"));
+    let db_path = nibe_core::config::db_path();
     let bind: SocketAddr = env("MCP_BIND").unwrap_or_else(|| "0.0.0.0:8080".into()).parse().context("MCP_BIND")?;
     let tz = nibe_core::timeutil::parse_tz(&env("TZ_NAME").unwrap_or_else(|| "Europe/Amsterdam".into()))?;
     let token = env("MCP_TOKEN");

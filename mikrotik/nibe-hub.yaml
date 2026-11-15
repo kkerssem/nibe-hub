@@ -81,7 +81,7 @@ services:
     image: ghcr.io/kkerssem/nibe-hub:latest
     command: /nibe-mcp
     restart: always
-    # healthy while the server accepts connections on port 443
+    # healthy while the server answers GET /healthz on port 443
     healthcheck:
       test: ["CMD", "/nibe-mcp", "health"]
       interval: 60s

@@ -251,20 +251,46 @@ pub struct DbStats {
     pub poll_interval_secs: Option<i64>,
 }
 
-impl DbStats {
-    /// Seconds since the last successful full poll.
+/// What the collector's health depends on: the last successful full poll and the poll interval.
+#[derive(Debug, Clone, Default)]
+pub struct PollHealth {
+    pub last_ok_poll_ms: Option<i64>,
+    pub poll_interval_secs: Option<i64>,
+    /// Error of the most recent poll, if that poll failed.
+    pub last_poll_error: Option<String>,
+}
+
+impl PollHealth {
+    /// Seconds since the last successful full poll; negative when it lies in the future.
     pub fn last_ok_poll_age_secs(&self, now_ms: i64) -> Option<i64> {
         self.last_ok_poll_ms.map(|t| (now_ms - t) / 1000)
     }
 
-    /// The collector counts as healthy while its last successful full poll is at most three poll
-    /// intervals (plus 30 s slack) old; without a recorded interval, 4 minutes. Used by the
+    /// The oldest the last successful poll may be: three poll intervals plus 30 s of slack,
+    /// or 4 minutes when no interval is recorded.
+    pub fn max_age_secs(&self) -> i64 {
+        self.poll_interval_secs.map_or(240, |i| 3 * i + 30)
+    }
+
+    /// Whether the clock is behind the last successful poll (it went back, for example after
+    /// a reboot before NTP has synced). The age then says nothing, so this counts as unhealthy.
+    pub fn clock_went_back(&self, now_ms: i64) -> bool {
+        self.last_ok_poll_age_secs(now_ms).is_some_and(|a| a < 0)
+    }
+
+    /// Healthy while the last successful poll is at most [`Self::max_age_secs`] old. Used by the
     /// `status` tool and by `nibe-collector health`.
-    pub fn collector_healthy(&self, now_ms: i64) -> bool {
-        match (self.last_ok_poll_age_secs(now_ms), self.poll_interval_secs) {
-            (Some(a), Some(i)) => a <= 3 * i + 30,
-            (Some(a), None) => a <= 240,
-            _ => false,
+    pub fn is_healthy(&self, now_ms: i64) -> bool {
+        self.last_ok_poll_age_secs(now_ms).is_some_and(|a| (0..=self.max_age_secs()).contains(&a))
+    }
+}
+
+impl DbStats {
+    pub fn health(&self) -> PollHealth {
+        PollHealth {
+            last_ok_poll_ms: self.last_ok_poll_ms,
+            poll_interval_secs: self.poll_interval_secs,
+            last_poll_error: self.last_poll_error.clone(),
         }
     }
 }
@@ -287,9 +313,14 @@ const INFO_COLS: &str = "id, title, description, unit, divisor, size, writable, 
 
 impl Reader {
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_busy_timeout(path, std::time::Duration::from_secs(10))
+    }
+
+    /// As [`Reader::open`], waiting at most `busy_timeout` for a lock held by the writer.
+    pub fn open_with_busy_timeout(path: &Path, busy_timeout: std::time::Duration) -> Result<Self> {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)
             .with_context(|| format!("opening database {path:?} read-only (is the collector running?)"))?;
-        conn.busy_timeout(std::time::Duration::from_secs(10))?;
+        conn.busy_timeout(busy_timeout)?;
         conn.pragma_update(None, "query_only", "ON")?;
         Ok(Self { conn })
     }
@@ -403,6 +434,19 @@ impl Reader {
             .optional()?)
     }
 
+    /// Only what the collector's health depends on, for the frequent health check.
+    pub fn poll_health(&self) -> Result<PollHealth> {
+        let last_poll_error: Option<Option<String>> = self
+            .conn
+            .query_row("SELECT error FROM polls ORDER BY ts_ms DESC LIMIT 1", [], |r| r.get(0))
+            .optional()?;
+        Ok(PollHealth {
+            last_ok_poll_ms: self.last_ok_poll_ms()?,
+            poll_interval_secs: self.meta_i64("poll_interval_secs")?,
+            last_poll_error: last_poll_error.flatten(),
+        })
+    }
+
     fn meta_i64(&self, key: &str) -> Result<Option<i64>> {
         Ok(self.meta(key)?.and_then(|s| s.parse().ok()))
     }
@@ -426,41 +470,41 @@ impl Reader {
             last_poll_ms: last_poll.as_ref().map(|p| p.0),
             last_poll_ok: last_poll.as_ref().map(|p| p.1),
             last_poll_error: last_poll.and_then(|p| p.2),
-            poll_interval_secs: self.meta("poll_interval_secs")?.and_then(|s| s.parse().ok()),
+            poll_interval_secs: self.meta_i64("poll_interval_secs")?,
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::DbStats;
+    use super::PollHealth;
 
-    fn stats(last_ok_poll_ms: Option<i64>, poll_interval_secs: Option<i64>) -> DbStats {
-        DbStats {
-            points: 0,
-            samples: 0,
-            db_bytes: 0,
-            first_sample_ms: None,
-            last_sample_ms: None,
-            last_ok_poll_ms,
-            last_poll_ms: None,
-            last_poll_ok: None,
-            last_poll_error: None,
-            poll_interval_secs,
-        }
+    fn health(last_ok_poll_ms: Option<i64>, poll_interval_secs: Option<i64>) -> PollHealth {
+        PollHealth { last_ok_poll_ms, poll_interval_secs, last_poll_error: None }
     }
 
     #[test]
     fn collector_health() {
         let now = 1_000_000_000;
         // never polled successfully
-        assert!(!stats(None, Some(60)).collector_healthy(now));
+        assert!(!health(None, Some(60)).is_healthy(now));
         // 60 s interval: healthy up to 3 * 60 + 30 = 210 s
-        assert!(stats(Some(now - 210_000), Some(60)).collector_healthy(now));
-        assert!(!stats(Some(now - 211_000), Some(60)).collector_healthy(now));
+        assert!(health(Some(now - 210_000), Some(60)).is_healthy(now));
+        assert!(!health(Some(now - 211_000), Some(60)).is_healthy(now));
         // no recorded interval: 240 s
-        assert!(stats(Some(now - 240_000), None).collector_healthy(now));
-        assert!(!stats(Some(now - 241_000), None).collector_healthy(now));
-        assert_eq!(stats(Some(now - 5_500), None).last_ok_poll_age_secs(now), Some(5));
+        assert!(health(Some(now - 240_000), None).is_healthy(now));
+        assert!(!health(Some(now - 241_000), None).is_healthy(now));
+        assert_eq!(health(Some(now - 5_500), None).last_ok_poll_age_secs(now), Some(5));
+    }
+
+    #[test]
+    fn clock_went_back_is_unhealthy() {
+        let now = 1_000_000_000;
+        let h = health(Some(now + 60_000), Some(60));
+        assert!(h.clock_went_back(now));
+        assert!(!h.is_healthy(now));
+        // a poll in the same second is not a clock jump
+        assert!(!health(Some(now + 500), Some(60)).clock_went_back(now));
+        assert!(health(Some(now + 500), Some(60)).is_healthy(now));
     }
 }
