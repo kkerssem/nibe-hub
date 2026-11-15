@@ -62,6 +62,8 @@ services:
       - data:/data
     environment:
       DB_PATH: /data/nibe.db
+      # RouterOS adds its own timestamp to each log line
+      LOG_TIMESTAMPS: "false"
       # the pump's local REST API, e.g. https://192.168.1.50:8443 (menu 7.5.15 on the pump)
       NIBE_URL: ""
       # user name and password set in menu 7.5.15
@@ -101,6 +103,8 @@ services:
         mode: 0400
     environment:
       DB_PATH: /data/nibe.db
+      # RouterOS adds its own timestamp to each log line
+      LOG_TIMESTAMPS: "false"
       MCP_BIND: 0.0.0.0:443
       MCP_TLS_CERT: /tls/cert.pem
       MCP_TLS_KEY: /tls/key.pem

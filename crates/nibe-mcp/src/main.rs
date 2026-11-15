@@ -163,9 +163,7 @@ async fn main() -> Result<()> {
     if nibe_core::config::health_requested() {
         std::process::exit(health());
     }
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
-        .init();
+    nibe_core::logging::init();
 
     let db_path = nibe_core::config::db_path();
     let bind: SocketAddr = env("MCP_BIND").unwrap_or_else(|| "0.0.0.0:8080".into()).parse().context("MCP_BIND")?;

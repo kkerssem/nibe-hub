@@ -964,7 +964,6 @@ dependencies = [
  "rustls-webpki",
  "tokio",
  "tracing",
- "tracing-subscriber",
  "url",
 ]
 
@@ -979,6 +978,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -996,7 +996,6 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
