@@ -318,6 +318,9 @@ A self-refreshing dashboard artifact needs HTTPS on port 443 with a publicly tru
 | `NIBE_TLS_FINGERPRINT` | | SHA-256 of the pump's certificate; an empty value is an error; without the variable the certificate is checked against the system CAs, which fails for the pump |
 | `NIBE_INSECURE_TLS` | false | `true` turns certificate verification off; not together with `NIBE_TLS_FINGERPRINT` |
 | `DB_PATH` | /data/nibe.db | |
+| `RUST_LOG` | info | log level, e.g. `debug` (logs every poll) |
+| `LOG_TIMESTAMPS` | true | `false` leaves the timestamp out of each log line, for a runtime that adds its own (the app sets it for RouterOS) |
+| `NO_COLOR` | | any value turns log colours off; they are only used when the output is a terminal anyway |
 | `MCP_TOKEN` | | required, or `MCP_ALLOW_NO_AUTH=true` |
 | `MCP_TLS_CERT`, `MCP_TLS_KEY` | | PEM files; both set means HTTPS |
 | `MCP_BIND`, `MCP_ALLOWED_HOSTS`, `TZ_NAME` | 0.0.0.0:8080, off once a token is set, Europe/Amsterdam | |

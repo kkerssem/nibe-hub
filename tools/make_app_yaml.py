@@ -38,8 +38,8 @@ for k in ["NIBE_URL", "NIBE_USER", "NIBE_PASS", "NIBE_TLS_FINGERPRINT", "MCP_TOK
     if not env.get(k, "").strip() or "<" in env[k]:
         fail(f"{k} is empty or still a placeholder in {args.env}")
 
-# Values the template sets itself (database path, MCP address and TLS files).
-FIXED = {"DB_PATH", "MCP_BIND", "MCP_TLS_CERT", "MCP_TLS_KEY"}
+# Values the template sets itself (database path, log format, MCP address and TLS files).
+FIXED = {"DB_PATH", "LOG_TIMESTAMPS", "MCP_BIND", "MCP_TLS_CERT", "MCP_TLS_KEY"}
 for k in sorted(FIXED & env.keys()):
     print(f"note: {k} from {args.env} is ignored; the app sets it", file=sys.stderr)
 
