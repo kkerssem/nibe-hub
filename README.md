@@ -175,14 +175,16 @@ For that VLAN:
 
 ### Steps
 
-1. **Push the image to a registry.** Apps pull images from a registry and cannot import a tar file. Log in once with a GitHub token that has the `write:packages` scope, then push:
+1. **Get the image into a registry.** Apps pull images from a registry and cannot import a tar file. The GitHub Actions workflow [.github/workflows/image.yml](.github/workflows/image.yml) does this:
 
-   ```sh
-   container registry login ghcr.io
-   tools/push_image.sh
-   ```
+   - on every push to `main` it runs the tests, builds the arm64 image on a native arm64 runner and pushes `ghcr.io/kkerssem/nibe-hub:<commit>` (the 7-character short sha) and `:latest`;
+   - a `v1.2.3` git tag also gets a `1.2.3` image tag;
+   - pull requests are tested and built but not pushed;
+   - it can be started by hand under Actions → Image → Run workflow.
 
-   This pushes `ghcr.io/kkerssem/nibe-hub:<commit>` and `:latest`; set `IMAGE_REPO` for another registry. A new ghcr.io package is private, and Apps document no registry login, so make the package public in its GitHub settings. It contains only the two binaries and CA certificates.
+   **Once, after the first push:** the new package is private, like the repository, and Apps document no registry login. Make the package public on GitHub (your profile → Packages → `nibe-hub` → Package settings → Change visibility). It contains only the two binaries and CA certificates, no configuration or secrets.
+
+   For a manual push from the Mac, or to another registry, use `tools/push_image.sh` (after `container registry login ghcr.io` with a token that has the `write:packages` scope; set `IMAGE_REPO` for another registry).
 
 2. **Pick the app's address.** The app's VETH gets its address from the DHCP server of the network (or VLAN) it is attached to. Choose a free address there and create the MCP certificate for it (as in [HTTPS for the MCP server](#https-for-the-mcp-server), with `subjectAltName=IP:<app-ip>`).
 
@@ -192,7 +194,7 @@ For that VLAN:
    python3 tools/make_app_yaml.py --cert cert.pem --key key.pem
    ```
 
-   This writes `mikrotik/nibe-hub.app.local.yaml` (mode 0600, git-ignored). It contains the pump password, the MCP token and the TLS key, because RouterOS generates the values of app `secrets` itself and the documentation describes no way to supply your own. Each service gets only its own settings, as with `run_local.sh`. Add `--image ghcr.io/kkerssem/nibe-hub:<commit>` to pin a version instead of `latest`.
+   This writes `mikrotik/nibe-hub.app.local.yaml` (mode 0600, git-ignored). It contains the pump password, the MCP token and the TLS key, because RouterOS generates the values of app `secrets` itself and the documentation describes no way to supply your own. Each service gets only its own settings, as with `run_local.sh`. Add `--image ghcr.io/kkerssem/nibe-hub:<short-sha>` to pin a version instead of `latest`; each workflow run lists its tags in its summary.
 
 4. **Add the app on the router.** Upload the file, then:
 

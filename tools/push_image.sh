@@ -1,6 +1,7 @@
 #!/bin/sh
 # Builds the arm64 image and pushes it to a registry, for a MikroTik App (which pulls images
-# from a registry; it cannot import a tar file).
+# from a registry; it cannot import a tar file). Normally the GitHub Actions workflow does this
+# on every push to main; use this script for a manual push or another registry.
 #
 #   tools/push_image.sh            # pushes ghcr.io/kkerssem/nibe-hub:<commit> and :latest
 #   IMAGE_REPO=ghcr.io/you/nibe-hub tools/push_image.sh
@@ -19,7 +20,8 @@ if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
     echo "the working tree has uncommitted changes; commit first so the tag matches the code" >&2
     exit 1
 fi
-TAG=$(git rev-parse --short=12 HEAD)
+# same 7-character tag as the GitHub Actions workflow (.github/workflows/image.yml)
+TAG=$(git rev-parse --short=7 HEAD)
 
 container build --platform linux/arm64 -t "nibe-hub:$TAG" .
 for t in "$TAG" latest; do
