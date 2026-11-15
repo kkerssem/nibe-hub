@@ -1,0 +1,78 @@
+# MikroTik App definition for nibe-hub (RouterOS 7.26+ with the container package).
+#
+# This is a template. Fill it in with
+#   python3 tools/make_app_yaml.py --cert cert.pem --key key.pem
+# which reads .env and writes mikrotik/nibe-hub.app.local.yaml (git-ignored: it contains the
+# pump password, the MCP token and the TLS key). Upload that file and add it with
+#   /app/add yaml=[/file/get nibe-hub.app.local.yaml contents]
+#
+# Why values are written into the file: RouterOS generates the values of app `secrets`
+# itself, and the documentation describes no way to supply your own, so the pump password
+# cannot be a secret.
+#
+# Both services share one VETH on an existing bridge, so the MCP server is reachable at that
+# VETH's own address on port 443, next to the router's own HTTPS. Give the address a static
+# DHCP lease (see README, "RB5009 as a MikroTik App").
+#
+# `lan` below is the bridge set as lan-bridge in /app/settings; put a bridge name there to use
+# another bridge. For a VLAN on a vlan-filtering bridge, set the app property network-pvid
+# after /app/add and before /app/enable: /app/set nibe-hub network-pvid=<vlan-id>
+# (it is not a YAML field).
+
+name: nibe-hub
+descr: NIBE S735C heat pump history - collector and read-only MCP server
+# free-form group in the app list (the documentation shows "networking" and "development")
+category: networking
+supported-archs:
+  - arm64
+
+networks:
+  default:
+    name: lan
+    external: true
+
+volumes:
+  data:
+
+configs:
+  mcp-tls-cert:
+    content: |
+{{MCP_TLS_CERT_PEM}}
+  mcp-tls-key:
+    content: |
+{{MCP_TLS_KEY_PEM}}
+
+services:
+  # The only writer of the database. Talks to the pump with GET requests only.
+  collector:
+    image: {{IMAGE}}
+    command: /nibe-collector
+    restart: always
+    volumes:
+      - data:/data
+    environment:
+      DB_PATH: /data/nibe.db
+{{COLLECTOR_ENV}}
+
+  # Read-only MCP server over HTTPS on port 443 of the app's address.
+  mcp:
+    image: {{IMAGE}}
+    command: /nibe-mcp
+    restart: always
+    depends_on:
+      - collector
+    volumes:
+      - data:/data
+    configs:
+      - source: mcp-tls-cert
+        target: /tls/cert.pem
+        mode: 0444
+      - source: mcp-tls-key
+        target: /tls/key.pem
+        mode: 0400
+    environment:
+      DB_PATH: /data/nibe.db
+      MCP_BIND: 0.0.0.0:443
+      MCP_TLS_CERT: /tls/cert.pem
+      MCP_TLS_KEY: /tls/key.pem
+{{MCP_ENV}}

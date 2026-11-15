@@ -142,6 +142,101 @@ openssl req -x509 -new -key key.pem -days 3650 -out cert.pem \
 
 Upload both files to `/usb1/nibe-tls` on the router and keep `cert.pem` on the Mac for Claude Desktop. Without these variables the server falls back to plain HTTP and logs a warning when it listens on a non-loopback address.
 
+## RB5009 as a MikroTik App
+
+An alternative to the `/container` setup above (RouterOS 7.26 or later with the container package). [mikrotik/nibe-hub.app.yaml](mikrotik/nibe-hub.app.yaml) defines one app with two services, `collector` and `mcp`, sharing a `data` volume. The app gets its own VETH on your LAN bridge, so the MCP server listens on port 443 of that VETH's own address, next to the router's own HTTPS. No port forwarding is needed.
+
+### How the app is networked
+
+The YAML attaches the app to an existing bridge instead of an app-created network:
+
+```yaml
+networks:
+  default:
+    name: lan
+    external: true
+```
+
+- **`external: true`** means: use an existing bridge. Without it, RouterOS puts the app on its own `internal` network (`172.18.0.1/24`) behind NAT with a masquerade rule, and only ports listed under `ports` would be reachable, through dst-nat rules on the router's own address.
+- **`lan`** is not something you create: it is an alias for the bridge set as `lan-bridge` in `/app/settings`. When that is empty, RouterOS uses the bridge it detected itself, shown as the read-only `assumed-lan-bridge`. Check with `/app/settings/print`.
+- **Another bridge:** external networks also accept a bridge name, so `name: <bridge-name>` attaches the app to that bridge regardless of `lan-bridge`. Use this when each of your networks has its own bridge.
+- **One VETH for the app:** RouterOS creates a single `veth-app-<app>` per app, so both services most likely share one address. Only the MCP server listens on it.
+
+### Running the app on a VLAN
+
+With VLANs on one bridge (`vlan-filtering=yes`), the bridge is the same for every app, and the VLAN is chosen with the app property **`network-pvid`**. It sets the PVID of the app's bridge port (default `1`), which makes the VETH an untagged access port on that VLAN. It is an app property, not a YAML field: set it after `/app/add` and before `/app/enable` (new apps are created disabled, and their configuration can be edited until they are enabled). See step 4 below.
+
+For that VLAN:
+
+- **Bridge VLAN table:** the VLAN must be in `/interface/bridge/vlan` with the bridge itself as a tagged member, as for any VLAN the router routes. RouterOS adds the app's port as untagged itself, based on its PVID.
+- **DHCP:** the VETH's DHCP request arrives on that VLAN, so the DHCP server on the VLAN interface hands out the address, and that is where you make the lease static (step 5). The MCP certificate must be for an address in that VLAN's subnet.
+- **Firewall:** allow forwarding from the machine that runs Claude to the app's address on TCP 443. The collector needs TCP 8443 to the pump; if the pump is on another VLAN, allow that too, only from the app's address.
+- **Outgoing access:** leave `network-outgoing-access` at `yes` (the default). `no` blocks all outgoing connections of the app with a mangle drop rule, which also cuts the collector off from the pump; restrict traffic with your own forward rules instead.
+
+### Steps
+
+1. **Push the image to a registry.** Apps pull images from a registry and cannot import a tar file. Log in once with a GitHub token that has the `write:packages` scope, then push:
+
+   ```sh
+   container registry login ghcr.io
+   tools/push_image.sh
+   ```
+
+   This pushes `ghcr.io/kkerssem/nibe-hub:<commit>` and `:latest`; set `IMAGE_REPO` for another registry. A new ghcr.io package is private, and Apps document no registry login, so make the package public in its GitHub settings. It contains only the two binaries and CA certificates.
+
+2. **Pick the app's address.** The app's VETH gets its address from the DHCP server of the network (or VLAN) it is attached to. Choose a free address there and create the MCP certificate for it (as in [HTTPS for the MCP server](#https-for-the-mcp-server), with `subjectAltName=IP:<app-ip>`).
+
+3. **Generate the app definition** from your `.env` and the certificate:
+
+   ```sh
+   python3 tools/make_app_yaml.py --cert cert.pem --key key.pem
+   ```
+
+   This writes `mikrotik/nibe-hub.app.local.yaml` (mode 0600, git-ignored). It contains the pump password, the MCP token and the TLS key, because RouterOS generates the values of app `secrets` itself and the documentation describes no way to supply your own. Each service gets only its own settings, as with `run_local.sh`. Add `--image ghcr.io/kkerssem/nibe-hub:<commit>` to pin a version instead of `latest`.
+
+4. **Add the app on the router.** Upload the file, then:
+
+   ```routeros
+   /app/settings/set disk=usb1 lan-bridge=<your-bridge>
+   /app/add yaml=[/file/get nibe-hub.app.local.yaml contents]
+   # only for a VLAN on a vlan-filtering bridge; leave out for the untagged LAN (PVID 1)
+   /app/set nibe-hub network-pvid=<vlan-id>
+   /app/enable nibe-hub
+   /file/remove nibe-hub.app.local.yaml
+   ```
+
+   After enabling, `/interface/bridge/port/print where interface~"veth-app-nibe-hub"` should show the bridge and PVID you expect.
+
+5. **Make the address static.** Find the app's VETH and its lease, and make the lease static. The lease must match the router-side `mac-address`, not `container-mac-address`:
+
+   ```routeros
+   /interface/veth/print detail where name~"veth-app-nibe-hub"
+   /ip/dhcp-server/lease/print where host-name~"veth-app-nibe-hub"
+   /ip/dhcp-server/lease/make-static [find where host-name~"veth-app-nibe-hub"]
+   ```
+
+   If the lease didn't get the address in your certificate, set it on the static lease (`address=<app-ip>`) and restart the app.
+
+### Why the file contains the secrets
+
+App-level `secrets` take only a name (`mcp-token:`); RouterOS generates the value itself when the app runs and stores it under `<disk>/apps/<app>/secret-<name>`. Services reference it as `[secret:name]` in `environment` or read it from `/run/secrets/<name>`. The documentation describes no way to set or override the value, so:
+
+- the **pump password** has to be the one set on the pump and is written into the file;
+- the **TLS key** has to match your certificate and is written into the file;
+- the **MCP token** could be generated (`secrets: {mcp-token:}` and `MCP_TOKEN: "[secret:mcp-token]"`), but you need it on your Mac for Claude Desktop, and the documentation doesn't say how to read a generated value back. If `/app/print detail` (the read-only `variables-to-use-in-environment`) or the file `apps/nibe-hub/secret-mcp-token` turns out to show it, that would keep the token out of the file.
+
+Because RouterOS replaces `[name]` placeholders in environment values, `make_app_yaml.py` warns about a value that contains `[`.
+
+### Not yet tried on a real RB5009
+
+Check these before relying on it:
+
+- that the app's VETH has `dhcp=yes` (the documentation only says that apps create their VETHs automatically)
+- that its `mac-address` stays the same after `/app/restart`, `/app/disable` and `/app/enable`; if it changes, the static lease no longer matches
+- that both services share one VETH, as the single `veth-app-<app>` name suggests
+- that `/app/set nibe-hub network-pvid=<vlan-id>` is accepted before enabling, and that the bridge port gets that PVID
+- that `command: /nibe-mcp` replaces the image's default command (`/nibe-collector`)
+
 ## The pump's TLS certificate
 
 The pump uses a self-signed certificate. Instead of turning verification off, pin it: the collector then accepts only that exact certificate, so a device that takes over the pump's IP address never gets the pump password. Read the fingerprint from the pump once:
