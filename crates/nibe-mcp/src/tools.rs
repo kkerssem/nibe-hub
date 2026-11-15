@@ -192,7 +192,7 @@ impl NibeServer {
         .await
     }
 
-    #[tool(description = "Efficiency overview per hour/day/week/month for the NIBE S735C: electricity from integrated power (unit and compressor), the cumulative lifetime counters' deltas, COP from the counters and from the integrated power, heating vs hot water counter deltas, average outdoor and exhaust-air temperature and the compressor duty fraction. The COP is NIBE's own heat estimate, not an independent heat meter. Read the 'notes' in the result before drawing conclusions.")]
+    #[tool(description = "Efficiency overview per bucket (3h, day, week, month) for the NIBE S735C: electricity from integrated power (elec_unit_kwh, elec_compressor_kwh), heat from the pump's energy-log counters (heat_kwh incl. additional heat, heat_compressor_only_kwh, split into heating_kwh and hotwater_kwh), and cop_unit = heat_kwh / elec_unit_kwh and cop_compressor = heat_compressor_only_kwh / elec_compressor_kwh. A COP is only given with at least 1 kWh of heat in the bucket, so short buckets at low load stay empty: use 3h or longer. Also average outdoor and exhaust-air temperature and the compressor duty fraction; lifetime_*_delta_kwh are informational only and are not COP inputs. The heat is NIBE's own estimate, not an independent heat meter. Read the 'notes' in the result before drawing conclusions.")]
     async fn cop(&self, Parameters(a): Parameters<CopArgs>) -> Result<CallToolResult, McpError> {
         self.run(move |r, tz, now| {
             let from = parse_time(&a.from, now, tz)?;
