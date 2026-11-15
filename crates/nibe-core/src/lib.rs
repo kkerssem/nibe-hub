@@ -3,6 +3,7 @@
 
 pub mod analysis;
 pub mod api;
+pub mod config;
 pub mod db;
 pub mod series;
 pub mod timeutil;

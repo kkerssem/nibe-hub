@@ -4,6 +4,7 @@
 mod tls;
 
 use anyhow::{anyhow, bail, Context, Result};
+use nibe_core::config::env;
 use nibe_core::api::{normalize_raw, parse_point_response, parse_points, ApiPoint};
 use nibe_core::db::Store;
 use nibe_core::timeutil::now_ms;
@@ -33,10 +34,6 @@ struct Config {
     fast_ids: Vec<i64>,
     fast: Duration,
     db_path: PathBuf,
-}
-
-fn env(key: &str) -> Option<String> {
-    std::env::var(key).ok().filter(|v| !v.trim().is_empty())
 }
 
 /// A whole number from the environment, with an error that shows the offending value
@@ -94,7 +91,7 @@ impl Config {
             poll: Duration::from_secs(poll),
             fast_ids,
             fast: Duration::from_secs(fast),
-            db_path: env("DB_PATH").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/data/nibe.db")),
+            db_path: nibe_core::config::db_path(),
         })
     }
 }
@@ -296,8 +293,45 @@ async fn shutdown_signal() {
     }
 }
 
+/// `nibe-collector health`, for a container health check: exit code 0 while the last
+/// successful full poll in the database is recent (the same rule as `healthy` in the MCP
+/// `status` tool). Reads the database only, so it needs just DB_PATH, not the pump settings.
+/// Waits at most 2 s for a database lock, so it can still report within the check's timeout.
+fn health() -> i32 {
+    let db_path = nibe_core::config::db_path();
+    let h = match nibe_core::db::Reader::open_with_busy_timeout(&db_path, Duration::from_secs(2)).and_then(|r| r.poll_health()) {
+        Ok(h) => h,
+        Err(e) => {
+            println!("unhealthy: {e:#}");
+            return 1;
+        }
+    };
+    let now = now_ms();
+    let healthy = h.is_healthy(now);
+    let interval = h.poll_interval_secs.map_or("unknown".to_string(), |i| format!("{i} s"));
+    match h.last_ok_poll_age_secs(now) {
+        None => println!("unhealthy: no successful poll yet"),
+        Some(age) if h.clock_went_back(now) => {
+            println!("unhealthy: the last successful poll is {} s in the future; the clock went back", -age)
+        }
+        Some(age) => println!(
+            "{}: last successful poll {age} s ago, poll interval {interval}",
+            if healthy { "healthy" } else { "unhealthy" }
+        ),
+    }
+    if !healthy {
+        if let Some(e) = &h.last_poll_error {
+            println!("last poll error: {e}");
+        }
+    }
+    if healthy { 0 } else { 1 }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    if nibe_core::config::health_requested() {
+        std::process::exit(health());
+    }
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
