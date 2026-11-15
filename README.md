@@ -182,7 +182,7 @@ For that VLAN:
    - pull requests are tested and built but not pushed;
    - it can be started by hand under Actions → Image → Run workflow.
 
-   **Once, after the first push:** the new package is private, like the repository, and Apps document no registry login. Make the package public on GitHub (your profile → Packages → `nibe-hub` → Package settings → Change visibility). It contains only the two binaries and CA certificates, no configuration or secrets.
+   **Once, after the first push:** the new package is private, and Apps pull without a registry login: on the RB5009 a private package fails to download with `auth error`. Make the package public on GitHub (your profile → Packages → `nibe-hub` → Package settings → Change visibility). This is needed even when the repository itself is public, because a package has its own visibility. It contains only the two binaries and CA certificates, no configuration or secrets.
 
    For a manual push from the Mac, or to another registry, use `tools/push_image.sh` (after `container registry login ghcr.io` with a token that has the `write:packages` scope; set `IMAGE_REPO` for another registry).
 
@@ -199,19 +199,25 @@ For that VLAN:
 
      This writes `mikrotik/nibe-hub-local.yaml` (mode 0600, git-ignored). It contains the pump password, the MCP token and the TLS key, because RouterOS generates the values of app `secrets` itself and the documentation describes no way to supply your own. Each service gets only its own settings, as with `run_local.sh`, and only the optional settings that are in `.env`. Add `--image ghcr.io/kkerssem/nibe-hub:<short-sha>` to pin a version instead of `latest`; each workflow run lists its tags in its summary.
 
-4. **Add the app on the router.** Upload the file (`nibe-hub.yaml` or `nibe-hub-local.yaml`), then:
+4. **Add the app on the router.** Upload the file (`nibe-hub.yaml` or `nibe-hub-local.yaml`; keep a single `.yaml` extension, as RouterOS didn't handle a name like `nibe-hub.app.yaml`), then:
 
    ```routeros
    /app/settings/set disk=usb1 lan-bridge=<your-bridge>
    /app/add yaml=[/file/get nibe-hub-local.yaml contents]
    # only for a VLAN on a vlan-filtering bridge; leave out for the untagged LAN (PVID 1)
    /app/set nibe-hub network-pvid=<vlan-id>
+   # no RouterOS reverse proxy: the MCP server does its own HTTPS on the app's address
+   /app/set nibe-hub use-https=no
    # with the file without secrets: fill in the empty values and the TLS configs here
    /app/enable nibe-hub
    /file/remove nibe-hub-local.yaml
    ```
 
    After enabling, `/interface/bridge/port/print where interface~"veth-app-nibe-hub"` should show the bridge and PVID you expect.
+
+   **`use-https=no` is required.** It defaults to `yes`, which puts RouterOS's own reverse proxy in front of the app with the cloud app certificate from `/app/settings`. nibe-hub has no web port for it (the YAML has no `ports`), and the app then stays at the status `waiting for reverse proxy` and never pulls its images. Like `network-pvid`, it is an app property, not a YAML field.
+
+   RouterOS pulls the image once per service. While settings are still empty, the services exit with code 1 and the log says what is missing (`NIBE_URL is missing`, `MCP_TOKEN is missing`); fill them in on the router and restart the app.
 
 5. **Make the address static.** Find the app's VETH and its lease, and make the lease static. The lease must match the router-side `mac-address`, not `container-mac-address`:
 
@@ -233,17 +239,24 @@ App-level `secrets` take only a name (`mcp-token:`); RouterOS generates the valu
 
 Because RouterOS replaces `[name]` placeholders in environment values, `make_app_yaml.py` warns about a value that contains `[`.
 
-### Not yet tried on a real RB5009
+### Verified on an RB5009
 
-Check these before relying on it:
+Tried with the file without secrets, on a vlan-filtering bridge with the app on VLAN 20:
 
-- that the app's VETH has `dhcp=yes` (the documentation only says that apps create their VETHs automatically)
-- that its `mac-address` stays the same after `/app/restart`, `/app/disable` and `/app/enable`; if it changes, the static lease no longer matches
-- that both services share one VETH, as the single `veth-app-<app>` name suggests
-- that `/app/set nibe-hub network-pvid=<vlan-id>` is accepted before enabling, and that the bridge port gets that PVID
-- that `command: /nibe-mcp` replaces the image's default command (`/nibe-collector`)
-- which parts of an added app can be edited on the router before enabling it: the environment values, and the contents of the `mcp-tls-cert` and `mcp-tls-key` configs (needed when adding the file without secrets)
-- that empty environment values (`NIBE_PASS: ""`) are accepted by `/app/add`
+- RouterOS reads [mikrotik/nibe-hub.yaml](mikrotik/nibe-hub.yaml) with `/app/add`, including the empty environment values (`NIBE_PASS: ""`).
+- Before enabling, the bridge and `network-pvid` can be changed on the router; the app's bridge port becomes active on that bridge with that PVID.
+- The app's VETH gets its address from the DHCP server of that VLAN.
+- `use-https=no` is needed (see step 4), and the image package must be public (see step 1).
+- The environment values and the contents of the `mcp-tls-cert` and `mcp-tls-key` configs can be filled in on the router after `/app/add`.
+- `command:` picks the binary per service: the collector polls the pump (pinned certificate, full poll every 60 s, fast polling of 1801 and 22130), and the MCP server answers on `https://<app-ip>/mcp` with the certificate for that address. Requests without a token or with a wrong one get `401`; all six tools work.
+- Resource use (RouterOS app stats): about 4 MiB of memory for both services, an image of 21.7 MiB, around 1 MiB of data after the first hour, and short CPU blips of 0.2–0.3 % at each full poll.
+
+### Still to check on the RB5009
+
+- that the VETH's `mac-address` stays the same after `/app/restart`, `/app/disable` and `/app/enable`; if it changes, the static lease no longer matches
+- that both services share the one VETH, as the single `veth-app-<app>` name suggests
+- whether a generated app secret can be read back (see above), which would keep the MCP token out of the YAML
+- how fast the database grows over days and weeks (`db_megabytes` in the `status` tool)
 - that the `healthcheck` of both services is accepted, and what RouterOS does when one fails: only show it, or restart the service
 
 ## The pump's TLS certificate
@@ -279,7 +292,7 @@ An empty `NIBE_TLS_FINGERPRINT=` line is an error rather than "not set", so a te
 }
 ```
 
-`NODE_EXTRA_CA_CERTS` makes `mcp-remote` trust the self-signed certificate. For the local Apple container, use `http://127.0.0.1:8080/mcp` with `--allow-http` and no `env`; that traffic never leaves the Mac.
+Use `https://<app-ip>/mcp` (port 443) for the MikroTik App. `NODE_EXTRA_CA_CERTS` makes `mcp-remote` trust the self-signed certificate. For the local Apple container, use `http://127.0.0.1:8080/mcp` with `--allow-http` and no `env`; that traffic never leaves the Mac.
 
 A self-refreshing dashboard artifact needs HTTPS on port 443 with a publicly trusted certificate (a reverse proxy or tunnel); that is not built in here.
 
