@@ -144,7 +144,7 @@ Upload both files to `/usb1/nibe-tls` on the router and keep `cert.pem` on the M
 
 ## RB5009 as a MikroTik App
 
-An alternative to the `/container` setup above (RouterOS 7.26 or later with the container package). [mikrotik/nibe-hub.app.yaml](mikrotik/nibe-hub.app.yaml) defines one app with two services, `collector` and `mcp`, sharing a `data` volume. The app gets its own VETH on your LAN bridge, so the MCP server listens on port 443 of that VETH's own address, next to the router's own HTTPS. No port forwarding is needed.
+An alternative to the `/container` setup above (RouterOS 7.26 or later with the container package). [mikrotik/nibe-hub.yaml](mikrotik/nibe-hub.yaml) defines one app with two services, `collector` and `mcp`, sharing a `data` volume. The app gets its own VETH on your LAN bridge, so the MCP server listens on port 443 of that VETH's own address, next to the router's own HTTPS. No port forwarding is needed.
 
 ### How the app is networked
 
@@ -188,7 +188,7 @@ For that VLAN:
 
 2. **Pick the app's address.** The app's VETH gets its address from the DHCP server of the network (or VLAN) it is attached to. Choose a free address there and create the MCP certificate for it (as in [HTTPS for the MCP server](#https-for-the-mcp-server), with `subjectAltName=IP:<app-ip>`).
 
-3. **Choose how the settings get into the app.** [mikrotik/nibe-hub.app.yaml](mikrotik/nibe-hub.app.yaml) is a complete app definition without secrets: the pump URL, user, password, fingerprint and MCP token are empty, and the two TLS configs hold a placeholder line. Either:
+3. **Choose how the settings get into the app.** [mikrotik/nibe-hub.yaml](mikrotik/nibe-hub.yaml) is a complete app definition without secrets: the pump URL, user, password, fingerprint and MCP token are empty, and the two TLS configs hold a placeholder line. Either:
 
    - **add it as it is** and fill in those values on the router before enabling the app. Until they are set, the services stop at startup with a message naming what is missing; or
    - **generate a filled-in copy** from your `.env` and the certificate:
@@ -197,18 +197,18 @@ For that VLAN:
      python3 tools/make_app_yaml.py --cert cert.pem --key key.pem
      ```
 
-     This writes `mikrotik/nibe-hub.app.local.yaml` (mode 0600, git-ignored). It contains the pump password, the MCP token and the TLS key, because RouterOS generates the values of app `secrets` itself and the documentation describes no way to supply your own. Each service gets only its own settings, as with `run_local.sh`, and only the optional settings that are in `.env`. Add `--image ghcr.io/kkerssem/nibe-hub:<short-sha>` to pin a version instead of `latest`; each workflow run lists its tags in its summary.
+     This writes `mikrotik/nibe-hub-local.yaml` (mode 0600, git-ignored). It contains the pump password, the MCP token and the TLS key, because RouterOS generates the values of app `secrets` itself and the documentation describes no way to supply your own. Each service gets only its own settings, as with `run_local.sh`, and only the optional settings that are in `.env`. Add `--image ghcr.io/kkerssem/nibe-hub:<short-sha>` to pin a version instead of `latest`; each workflow run lists its tags in its summary.
 
-4. **Add the app on the router.** Upload the file (`nibe-hub.app.yaml` or `nibe-hub.app.local.yaml`), then:
+4. **Add the app on the router.** Upload the file (`nibe-hub.yaml` or `nibe-hub-local.yaml`), then:
 
    ```routeros
    /app/settings/set disk=usb1 lan-bridge=<your-bridge>
-   /app/add yaml=[/file/get nibe-hub.app.local.yaml contents]
+   /app/add yaml=[/file/get nibe-hub-local.yaml contents]
    # only for a VLAN on a vlan-filtering bridge; leave out for the untagged LAN (PVID 1)
    /app/set nibe-hub network-pvid=<vlan-id>
    # with the file without secrets: fill in the empty values and the TLS configs here
    /app/enable nibe-hub
-   /file/remove nibe-hub.app.local.yaml
+   /file/remove nibe-hub-local.yaml
    ```
 
    After enabling, `/interface/bridge/port/print where interface~"veth-app-nibe-hub"` should show the bridge and PVID you expect.

@@ -5,4 +5,5 @@
 *.db
 *.db-shm
 *.db-wal
+*-local.yaml
 *.local.yaml
