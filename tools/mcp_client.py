@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Minimale MCP-client (streamable HTTP) om de server te testen zonder Claude.
+"""Minimal MCP client (streamable HTTP) for testing the server without Claude.
 
     python3 tools/mcp_client.py http://127.0.0.1:8080/mcp TOKEN tools
     python3 tools/mcp_client.py http://127.0.0.1:8080/mcp TOKEN call status '{}'

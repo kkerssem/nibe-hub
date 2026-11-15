@@ -72,10 +72,10 @@ The MCP process does not restart on its own. After a reboot, or after the contai
 `tools/mock_nibe.py` serves `testdata/points.json.gz` (a real dump from this installation) over HTTPS with basic auth, and makes a few values move:
 
 ```sh
-python3 tools/mock_nibe.py --port 8443 --user nibe --password geheim
+python3 tools/mock_nibe.py --port 8443 --user nibe --password secret
 ```
 
-Containers reach the Mac through the gateway of the default container network, usually `192.168.64.1` (check with `container network list`). In `.env`, set `NIBE_URL=https://192.168.64.1:8443`, `NIBE_USER=nibe` and `NIBE_PASS=geheim`, then start the container as above and query the MCP server:
+Containers reach the Mac through the gateway of the default container network, usually `192.168.64.1` (check with `container network list`). In `.env`, set `NIBE_URL=https://192.168.64.1:8443`, `NIBE_USER=nibe` and `NIBE_PASS=secret`, then start the container as above and query the MCP server:
 
 ```sh
 python3 tools/mcp_client.py http://127.0.0.1:8080/mcp <MCP_TOKEN> call status '{}'

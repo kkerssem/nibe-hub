@@ -1,4 +1,4 @@
-//! Read-only MCP-server bovenop de SQLite-historie van de NIBE-collector.
+//! Read-only MCP server on top of the NIBE collector's SQLite history.
 
 mod tools;
 
@@ -60,24 +60,24 @@ async fn main() -> Result<()> {
     let token = env("MCP_TOKEN");
     let allow_no_auth = env("MCP_ALLOW_NO_AUTH").map(|v| v == "true" || v == "1").unwrap_or(false);
     if token.is_none() && !allow_no_auth {
-        anyhow::bail!("MCP_TOKEN ontbreekt. Zet een lang geheim token, of MCP_ALLOW_NO_AUTH=true voor een afgeschermd test-netwerk.");
+        anyhow::bail!("MCP_TOKEN is missing. Set a long secret token, or MCP_ALLOW_NO_AUTH=true for an isolated test network.");
     }
     if token.is_none() {
-        warn!("draait zonder authenticatie (MCP_ALLOW_NO_AUTH)");
+        warn!("running without authentication (MCP_ALLOW_NO_AUTH)");
     }
 
-    // De server leest alleen; hij controleert bij de start of de database te openen is, maar de
-    // collector mag later pas starten (de database wordt dan bij de eerste vraag geopend).
+    // The server only reads; at startup it checks whether the database can be opened, but the
+    // collector may start later (the database is then opened on the first request).
     match nibe_core::db::Reader::open(&db_path) {
-        Ok(_) => info!("database {db_path:?} gevonden"),
-        Err(e) => warn!("database nog niet beschikbaar: {e:#}"),
+        Ok(_) => info!("database {db_path:?} found"),
+        Err(e) => warn!("database not available yet: {e:#}"),
     }
 
     let server = NibeServer::new(db_path, tz);
     let mut cfg = StreamableHttpServerConfig::default();
-    // Host-validatie tegen DNS-rebinding. Achter een router/reverse proxy is de Host-header
-    // het IP of de hostnaam van de router; geef die expliciet op, of "*" om te negeren
-    // (het bearer-token blijft dan de beveiliging).
+    // Host validation against DNS rebinding. Behind a router/reverse proxy the Host header is
+    // the router's IP or host name; list it explicitly, or use "*" to skip the check
+    // (the bearer token then remains the protection).
     match env("MCP_ALLOWED_HOSTS").as_deref() {
         Some("*") => cfg = cfg.disable_allowed_hosts(),
         Some(list) => {
@@ -99,8 +99,8 @@ async fn main() -> Result<()> {
         .layer(middleware::from_fn_with_state(auth, require_token))
         .route("/healthz", get(|| async { "ok" }));
 
-    let listener = tokio::net::TcpListener::bind(bind).await.with_context(|| format!("luisteren op {bind}"))?;
-    info!("MCP luistert op http://{bind}/mcp");
+    let listener = tokio::net::TcpListener::bind(bind).await.with_context(|| format!("listening on {bind}"))?;
+    info!("MCP listening on http://{bind}/mcp");
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;

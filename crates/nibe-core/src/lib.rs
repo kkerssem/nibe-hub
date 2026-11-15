@@ -1,5 +1,5 @@
-//! Gedeelde logica voor de NIBE-collector en de MCP-server:
-//! API-model, SQLite-opslag, tijdgewogen aggregatie en bekende punt-id's.
+//! Shared logic for the NIBE collector and the MCP server:
+//! API model, SQLite storage, time-weighted aggregation and well-known point ids.
 
 pub mod analysis;
 pub mod api;

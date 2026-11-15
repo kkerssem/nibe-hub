@@ -1,8 +1,8 @@
-//! SQLite-opslag. De collector is de enige schrijver; de MCP-server opent de database read-only.
+//! SQLite storage. The collector is the only writer; the MCP server opens the database read-only.
 //!
-//! Alleen *veranderingen* worden opgeslagen (een waarde geldt tot het volgende sample).
-//! Het logboek `polls` legt vast wanneer de collector echt gemeten heeft, zodat
-//! "waarde onveranderd" te onderscheiden is van "collector lag eruit".
+//! Only *changes* are stored (a value holds until the next sample).
+//! The `polls` log records when the collector actually measured, so that
+//! "value unchanged" can be told apart from "collector was down".
 
 use crate::api::{clean_title, ApiPoint};
 use anyhow::{Context, Result};
@@ -66,7 +66,7 @@ impl PointInfo {
     }
 }
 
-// ---------------------------------------------------------------- schrijver
+// ---------------------------------------------------------------- writer
 
 pub struct Store {
     conn: Connection,
@@ -76,9 +76,9 @@ pub struct Store {
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).with_context(|| format!("map {dir:?} aanmaken"))?;
+            std::fs::create_dir_all(dir).with_context(|| format!("creating directory {dir:?}"))?;
         }
-        let conn = Connection::open(path).with_context(|| format!("database {path:?} openen"))?;
+        let conn = Connection::open(path).with_context(|| format!("opening database {path:?}"))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.busy_timeout(std::time::Duration::from_secs(10))?;
@@ -148,7 +148,7 @@ impl Store {
         Ok(())
     }
 
-    /// Slaat alleen waarden op die veranderd zijn. Geeft het aantal nieuwe samples terug.
+    /// Stores only values that changed. Returns the number of new samples.
     pub fn record(&mut self, ts_ms: i64, values: &[(i64, Option<i64>)]) -> Result<usize> {
         let tx = self.conn.transaction()?;
         let mut changed = 0;
@@ -174,7 +174,7 @@ impl Store {
             params![ts_ms, kind, ok as i64, points as i64, changed as i64, duration_ms, err],
         );
         if let Err(e) = r {
-            tracing::warn!("poll-log schrijven mislukt: {e}");
+            tracing::warn!("writing poll log failed: {e}");
         }
     }
 
@@ -183,7 +183,7 @@ impl Store {
     }
 }
 
-// ----------------------------------------------------------------- lezer
+// ----------------------------------------------------------------- reader
 
 pub struct Reader {
     conn: Connection,
@@ -222,7 +222,7 @@ const INFO_COLS: &str = "id, title, description, unit, divisor, size, writable, 
 impl Reader {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)
-            .with_context(|| format!("database {path:?} read-only openen (draait de collector al?)"))?;
+            .with_context(|| format!("opening database {path:?} read-only (is the collector running?)"))?;
         conn.busy_timeout(std::time::Duration::from_secs(10))?;
         conn.pragma_update(None, "query_only", "ON")?;
         Ok(Self { conn })
@@ -242,7 +242,7 @@ impl Reader {
             .optional()?)
     }
 
-    /// Zoekt op titel (alle woorden moeten voorkomen, hoofdletterongevoelig), id of eenheid.
+    /// Searches by title (all words must match, case-insensitive), id or unit.
     pub fn search(&self, query: Option<&str>, unit: Option<&str>, limit: usize) -> Result<Vec<PointInfo>> {
         let mut sql = format!("SELECT {INFO_COLS} FROM points WHERE 1=1");
         let mut args: Vec<String> = Vec::new();
@@ -267,7 +267,7 @@ impl Reader {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// Laatste sample van een punt: (tijdstip van verandering, ruwe waarde).
+    /// Latest sample of a point: (time of change, raw value).
     pub fn latest(&self, id: i64) -> Result<Option<(i64, Option<i64>)>> {
         Ok(self
             .conn
@@ -279,7 +279,7 @@ impl Reader {
             .optional()?)
     }
 
-    /// Het sample dat op `from` gold (basislijn) plus alle samples in `(from, to)`.
+    /// The sample in effect at `from` (baseline) plus all samples in `(from, to)`.
     pub fn samples(&self, id: i64, from: i64, to: i64) -> Result<Vec<(i64, Option<i64>)>> {
         let mut out = Vec::new();
         if let Some(b) = self
@@ -303,7 +303,7 @@ impl Reader {
         Ok(out)
     }
 
-    /// Tijdstippen van geslaagde volledige polls in `[from, to]`, plus de laatste vóór `from`.
+    /// Times of successful full polls in `[from, to]`, plus the last one before `from`.
     pub fn ok_polls(&self, from: i64, to: i64) -> Result<Vec<i64>> {
         let mut out = Vec::new();
         if let Some(b) = self

@@ -1,8 +1,8 @@
-//! Tijdgewogen aggregatie van "alleen bij verandering opgeslagen" samples.
+//! Time-weighted aggregation of samples that are stored only when they change.
 //!
-//! Een sample geldt tot het volgende sample (stapfunctie). Perioden waarin de collector
-//! niet gemeten heeft (gaten) tellen niet mee, zodat een gemiddelde of integraal nooit
-//! op verzonnen data rust.
+//! A sample holds until the next sample (step function). Periods in which the collector
+//! did not measure (gaps) are excluded, so an average or integral never rests on
+//! invented data.
 
 use anyhow::{bail, Result};
 
@@ -15,8 +15,8 @@ pub struct Seg {
 
 pub type Gap = (i64, i64);
 
-/// Bouwt segmenten over `[from, min(to, data_end))`. `samples` is oplopend, het eerste
-/// sample mag vóór `from` liggen (basislijn). Ontbrekende waarden (`None`) geven geen segment.
+/// Builds segments over `[from, min(to, data_end))`. `samples` is ascending; the first
+/// sample may lie before `from` (baseline). Missing values (`None`) produce no segment.
 pub fn build_segments(samples: &[(i64, Option<f64>)], from: i64, to: i64, data_end: i64, gaps: &[Gap]) -> Vec<Seg> {
     let cap = to.min(data_end);
     let mut segs = Vec::new();
@@ -65,9 +65,9 @@ pub enum Agg {
     Max,
     First,
     Last,
-    /// verschil over de bucket, bedoeld voor tellers (kWh-standen)
+    /// difference over the bucket, meant for counters (kWh meter readings)
     Delta,
-    /// ∫ waarde dt omgerekend naar kWh; alleen voor punten in W of kW
+    /// ∫ value dt converted to kWh; only for points in W or kW
     IntegralKwh,
 }
 
@@ -81,7 +81,7 @@ impl Agg {
             "last" => Agg::Last,
             "delta" => Agg::Delta,
             "integral_kwh" | "kwh" => Agg::IntegralKwh,
-            o => bail!("onbekende aggregatie {o:?}; kies avg, min, max, first, last, delta of integral_kwh"),
+            o => bail!("unknown aggregation {o:?}; choose avg, min, max, first, last, delta or integral_kwh"),
         })
     }
     pub fn name(&self) -> &'static str {
@@ -100,7 +100,7 @@ impl Agg {
 #[derive(Debug, Clone, Copy)]
 pub struct Stat {
     pub covered_ms: i64,
-    /// Σ waarde × duur (waarde·ms)
+    /// Σ value × duration (value·ms)
     pub integral: f64,
     pub min: f64,
     pub max: f64,
@@ -132,7 +132,7 @@ pub fn value_at(segs: &[Seg], t: i64) -> Option<f64> {
     segs.get(i).filter(|g| g.start <= t).map(|g| g.v)
 }
 
-/// `unit` is de eenheid van het punt; alleen nodig voor `IntegralKwh`.
+/// `unit` is the unit of the point; only needed for `IntegralKwh`.
 pub fn aggregate(segs: &[Seg], b0: i64, b1: i64, agg: Agg, unit: &str) -> Option<f64> {
     let st = stat(segs, b0, b1);
     if st.covered_ms == 0 {
@@ -171,7 +171,7 @@ mod tests {
 
     #[test]
     fn step_function_is_time_weighted() {
-        // 100 W gedurende 30 min, daarna 300 W gedurende 30 min => gemiddeld 200 W, 0,2 kWh
+        // 100 W for 30 min, then 300 W for 30 min => average 200 W, 0.2 kWh
         let samples = [(0, Some(100.0)), (1_800_000, Some(300.0))];
         let segs = build_segments(&samples, 0, 3_600_000, 3_600_000, &[]);
         assert_eq!(aggregate(&segs, 0, 3_600_000, Agg::Avg, "W"), Some(200.0));

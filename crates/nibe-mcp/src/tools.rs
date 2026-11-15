@@ -24,7 +24,7 @@ impl NibeServer {
         Self { db_path: Arc::new(db_path), tz }
     }
 
-    /// Voert een (blokkerende) databasequery uit en zet fouten om in een leesbare tool-fout.
+    /// Runs a (blocking) database query and turns errors into a readable tool error.
     async fn run<F>(&self, f: F) -> Result<CallToolResult, McpError>
     where
         F: FnOnce(&Reader, Tz, i64) -> Result<Value> + Send + 'static,
@@ -36,7 +36,7 @@ impl NibeServer {
             f(&reader, tz, now_ms())
         })
         .await
-        .map_err(|e| McpError::internal_error(format!("taak afgebroken: {e}"), None))?;
+        .map_err(|e| McpError::internal_error(format!("task aborted: {e}"), None))?;
         Ok(match res {
             Ok(v) => CallToolResult::success(vec![ContentBlock::text(serde_json::to_string(&v).unwrap_or_default())]),
             Err(e) => CallToolResult::error(vec![ContentBlock::text(format!("{e:#}"))]),
@@ -46,49 +46,49 @@ impl NibeServer {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListArgs {
-    /// Woorden uit de titel (alle moeten voorkomen), bv. "compressor power" of "BT20". Een getal zoekt ook op punt-id.
+    /// Title words (all must match), e.g. "compressor power" or "BT20". A number also matches the point id.
     pub search: Option<String>,
-    /// Alleen punten met deze eenheid, bv. "°C", "W", "kWh", "Hz", "m³/h".
+    /// Only points with this unit, e.g. "°C", "W", "kWh", "Hz", "m³/h".
     pub unit: Option<String>,
-    /// Maximaal aantal resultaten (standaard 50, maximaal 500).
+    /// Maximum number of results (default 50, at most 500).
     pub limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CurrentArgs {
-    /// Punt-id's, bv. [4, 22, 1801]. Laat leeg om op `search` te zoeken.
+    /// Point ids, e.g. [4, 22, 1801]. Leave empty to search with `search`.
     pub ids: Option<Vec<i64>>,
-    /// Titelwoorden als alternatief voor `ids`; geeft maximaal 40 punten.
+    /// Title words as an alternative to `ids`; returns at most 40 points.
     pub search: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DescribeArgs {
-    /// Punt-id.
+    /// Point id.
     pub id: i64,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SeriesArgs {
-    /// 1 tot 12 punt-id's.
+    /// 1 to 12 point ids.
     pub ids: Vec<i64>,
-    /// Begin: "-24h", "-7d", "today", "yesterday", "2026-11-01", "2026-11-01 08:00" (lokale tijd) of RFC 3339.
+    /// Start: "-24h", "-7d", "today", "yesterday", "2026-11-01", "2026-11-01 08:00" (local time) or RFC 3339.
     pub from: String,
-    /// Einde (standaard "now").
+    /// End (default "now").
     pub to: Option<String>,
-    /// "raw" (alle wijzigingen), "1m", "5m", "15m", "30m", "1h", "3h", "6h", "12h", "1d", "1w" of "1mo". Standaard "1h".
+    /// "raw" (every change), "1m", "5m", "15m", "30m", "1h", "3h", "6h", "12h", "1d", "1w" or "1mo". Default "1h".
     pub bucket: Option<String>,
-    /// Een of meer van "avg", "min", "max", "first", "last", "delta" (voor tellers) en "integral_kwh" (voor W/kW-punten). Standaard ["avg"].
+    /// One or more of "avg", "min", "max", "first", "last", "delta" (for counters) and "integral_kwh" (for W/kW points). Default ["avg"].
     pub aggs: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CopArgs {
-    /// Begin, zelfde notatie als bij `series`.
+    /// Start, same notation as for `series`.
     pub from: String,
-    /// Einde (standaard "now").
+    /// End (default "now").
     pub to: Option<String>,
-    /// "1h", "1d", "1w" of "1mo". Standaard "1d".
+    /// "1h", "1d", "1w" or "1mo". Default "1d".
     pub bucket: Option<String>,
 }
 
@@ -137,7 +137,7 @@ impl NibeServer {
     #[tool(description = "Full catalogue entry for one point, including NIBE's description of the value coding (for example '20 = Stopped, 40 = Starting, 60 = Running') and its latest value.")]
     async fn describe_point(&self, Parameters(a): Parameters<DescribeArgs>) -> Result<CallToolResult, McpError> {
         self.run(move |r, tz, _| {
-            let p = r.point(a.id)?.ok_or_else(|| anyhow::anyhow!("punt {} bestaat niet", a.id))?;
+            let p = r.point(a.id)?.ok_or_else(|| anyhow::anyhow!("point {} does not exist", a.id))?;
             let latest = r.latest(a.id)?;
             Ok(json!({
                 "point": p,
@@ -153,15 +153,15 @@ impl NibeServer {
         self.run(move |r, tz, _| {
             let infos = match (a.ids, a.search) {
                 (Some(ids), _) if !ids.is_empty() => {
-                    anyhow::ensure!(ids.len() <= 60, "maximaal 60 punten tegelijk");
+                    anyhow::ensure!(ids.len() <= 60, "at most 60 points at a time");
                     let mut v = Vec::new();
                     for id in ids {
-                        v.push(r.point(id)?.ok_or_else(|| anyhow::anyhow!("punt {id} bestaat niet"))?);
+                        v.push(r.point(id)?.ok_or_else(|| anyhow::anyhow!("point {id} does not exist"))?);
                     }
                     v
                 }
                 (_, Some(q)) => r.search(Some(&q), None, 40)?,
-                _ => anyhow::bail!("geef `ids` of `search` op"),
+                _ => anyhow::bail!("give `ids` or `search`"),
             };
             let stats = r.stats()?;
             let values: Vec<Value> = infos

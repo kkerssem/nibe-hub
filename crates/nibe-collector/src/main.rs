@@ -1,5 +1,5 @@
-//! Haalt periodiek alle datapunten op via de lokale NIBE REST-API en schrijft de
-//! veranderingen naar SQLite. Alleen GET-verzoeken; er wordt nooit iets op de warmtepomp gewijzigd.
+//! Periodically fetches all data points from the local NIBE REST API and writes the
+//! changes to SQLite. GET requests only; nothing on the heat pump is ever changed.
 
 use anyhow::{anyhow, bail, Context, Result};
 use nibe_core::api::{normalize_raw, parse_point_response, parse_points, ApiPoint};
@@ -29,21 +29,21 @@ fn env(key: &str) -> Option<String> {
 
 impl Config {
     fn from_env() -> Result<Self> {
-        let base_url = env("NIBE_URL").ok_or_else(|| anyhow!("NIBE_URL ontbreekt (bv. https://192.168.1.50:8443)"))?;
+        let base_url = env("NIBE_URL").ok_or_else(|| anyhow!("NIBE_URL is missing (e.g. https://192.168.1.50:8443)"))?;
         let poll = env("NIBE_POLL_SECS").map(|v| v.parse::<u64>()).transpose().context("NIBE_POLL_SECS")?.unwrap_or(60);
         let fast = env("NIBE_FAST_SECS").map(|v| v.parse::<u64>()).transpose().context("NIBE_FAST_SECS")?.unwrap_or(10);
         if poll < 10 || fast < 2 {
-            bail!("NIBE_POLL_SECS moet ≥ 10 zijn en NIBE_FAST_SECS ≥ 2; de pomp is geen database");
+            bail!("NIBE_POLL_SECS must be ≥ 10 and NIBE_FAST_SECS ≥ 2; the pump is not a database");
         }
         let fast_ids = env("NIBE_FAST_IDS")
             .map(|v| v.split(',').map(|s| s.trim().parse::<i64>()).collect::<Result<Vec<_>, _>>())
             .transpose()
-            .context("NIBE_FAST_IDS moet een kommagescheiden lijst punt-id's zijn")?
+            .context("NIBE_FAST_IDS must be a comma-separated list of point ids")?
             .unwrap_or_default();
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
-            user: env("NIBE_USER").ok_or_else(|| anyhow!("NIBE_USER ontbreekt"))?,
-            pass: env("NIBE_PASS").ok_or_else(|| anyhow!("NIBE_PASS ontbreekt"))?,
+            user: env("NIBE_USER").ok_or_else(|| anyhow!("NIBE_USER is missing"))?,
+            pass: env("NIBE_PASS").ok_or_else(|| anyhow!("NIBE_PASS is missing"))?,
             device: env("NIBE_DEVICE").map(|v| v.parse()).transpose()?.unwrap_or(0),
             insecure_tls: env("NIBE_INSECURE_TLS").map(|v| v != "false" && v != "0").unwrap_or(true),
             poll: Duration::from_secs(poll),
@@ -54,7 +54,7 @@ impl Config {
     }
 }
 
-/// Eén meetronde richting de schrijver-thread.
+/// One measurement round sent to the writer thread.
 enum Msg {
     Catalog(BTreeMap<i64, ApiPoint>),
     Sample {
@@ -74,7 +74,7 @@ fn writer_thread(mut store: Store, mut rx: mpsc::Receiver<Msg>, poll_secs: u64) 
         match msg {
             Msg::Catalog(pts) => {
                 if let Err(e) = store.upsert_catalog(&pts, now_ms()) {
-                    error!("catalogus bijwerken mislukt: {e:#}");
+                    error!("updating catalogue failed: {e:#}");
                 }
             }
             Msg::Sample { ts_ms, kind, values, duration_ms, reply } => {
@@ -87,7 +87,7 @@ fn writer_thread(mut store: Store, mut rx: mpsc::Receiver<Msg>, poll_secs: u64) 
                         let _ = reply.send(changed);
                     }
                     Err(e) => {
-                        error!("samples schrijven mislukt: {e:#}");
+                        error!("writing samples failed: {e:#}");
                         store.log_poll(ts_ms, kind, false, n, 0, duration_ms, Some(&format!("{e:#}")));
                         let _ = reply.send(0);
                     }
@@ -100,9 +100,9 @@ fn writer_thread(mut store: Store, mut rx: mpsc::Receiver<Msg>, poll_secs: u64) 
         let now = now_ms();
         if now - last_prune > 86_400_000 {
             last_prune = now;
-            // het pollogboek is alleen voor gatendetectie; 90 dagen is ruim voldoende
+            // the poll log is only used for gap detection; 90 days is plenty
             if let Err(e) = store.prune_polls(now - 90 * 86_400_000) {
-                warn!("poll-log opschonen mislukt: {e:#}");
+                warn!("pruning poll log failed: {e:#}");
             }
         }
     }
@@ -117,7 +117,7 @@ fn build_client(cfg: &Config) -> Result<reqwest::Client> {
         .pool_idle_timeout(Duration::from_secs(30))
         .user_agent("nibe-collector/0.1")
         .build()
-        .context("HTTP-client bouwen")
+        .context("building HTTP client")
 }
 
 async fn get(client: &reqwest::Client, cfg: &Config, path: &str) -> Result<Vec<u8>> {
@@ -147,19 +147,19 @@ async fn full_poll(client: &reqwest::Client, cfg: &Config, tx: &mpsc::Sender<Msg
     let pts = match parse_points(&body) {
         Ok(p) => p,
         Err(e) => {
-            let _ = tx.send(Msg::Failure { ts_ms, kind: "full", duration_ms: t0.elapsed().as_millis() as i64, error: format!("parseren: {e:#}") }).await;
+            let _ = tx.send(Msg::Failure { ts_ms, kind: "full", duration_ms: t0.elapsed().as_millis() as i64, error: format!("parsing: {e:#}") }).await;
             return Err(e);
         }
     };
     let n = pts.len();
     let values = to_values(&pts);
-    // de catalogus (titels, eenheden, schaal) wijzigt alleen bij een firmware-update: bij de start en dagelijks
+    // the catalogue (titles, units, scale) only changes with a firmware update: refresh at startup and daily
     if first {
-        tx.send(Msg::Catalog(pts)).await.map_err(|_| anyhow!("schrijver is gestopt"))?;
+        tx.send(Msg::Catalog(pts)).await.map_err(|_| anyhow!("writer has stopped"))?;
     }
     let (reply, rx) = oneshot::channel();
     let duration_ms = t0.elapsed().as_millis() as i64;
-    tx.send(Msg::Sample { ts_ms, kind: "full", values, duration_ms, reply }).await.map_err(|_| anyhow!("schrijver is gestopt"))?;
+    tx.send(Msg::Sample { ts_ms, kind: "full", values, duration_ms, reply }).await.map_err(|_| anyhow!("writer has stopped"))?;
     let changed = rx.await.unwrap_or(0);
     Ok((n, changed))
 }
@@ -190,7 +190,7 @@ async fn fast_loop(client: reqwest::Client, cfg: std::sync::Arc<Config>, tx: mps
         if let Some(e) = err {
             fails += 1;
             if fails == 1 || fails % 30 == 0 {
-                warn!("snelle poll mislukt ({fails}x): {e}");
+                warn!("fast poll failed ({fails}x): {e}");
             }
             let _ = tx.send(Msg::Failure { ts_ms, kind: "fast", duration_ms: t0.elapsed().as_millis() as i64, error: e }).await;
             tokio::time::sleep(Duration::from_secs((fails as u64).min(30) * 2)).await;
@@ -213,9 +213,9 @@ async fn main() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let cfg = std::sync::Arc::new(Config::from_env()?);
-    info!("NIBE {} (apparaat {}), poll {}s, db {:?}", cfg.base_url, cfg.device, cfg.poll.as_secs(), cfg.db_path);
+    info!("NIBE {} (device {}), poll {}s, db {:?}", cfg.base_url, cfg.device, cfg.poll.as_secs(), cfg.db_path);
     if cfg.insecure_tls {
-        info!("TLS-certificaat wordt niet gecontroleerd (zelfondertekend certificaat van de pomp)");
+        info!("TLS certificate is not verified (the pump uses a self-signed certificate)");
     }
     let store = Store::open(&cfg.db_path)?;
     let (tx, rx) = mpsc::channel::<Msg>(64);
@@ -235,34 +235,34 @@ async fn main() -> Result<()> {
     loop {
         tokio::select! {
             _ = tick.tick() => {}
-            _ = &mut shutdown => { info!("stoppen"); break; }
+            _ = &mut shutdown => { info!("stopping"); break; }
         }
         let refresh_catalog = first || last_catalog.elapsed() > Duration::from_secs(86_400);
         match full_poll(&client, &cfg, &tx, refresh_catalog).await {
             Ok((n, changed)) => {
                 if fails > 0 {
-                    info!("verbinding hersteld na {fails} mislukte polls");
+                    info!("connection restored after {fails} failed polls");
                 }
                 fails = 0;
                 if refresh_catalog {
                     last_catalog = Instant::now();
                 }
                 if first {
-                    info!("eerste poll: {n} punten, {changed} samples opgeslagen");
+                    info!("first poll: {n} points, {changed} samples stored");
                 } else {
-                    tracing::debug!("{n} punten, {changed} veranderd");
+                    tracing::debug!("{n} points, {changed} changed");
                 }
                 first = false;
                 if !fast_started && !cfg.fast_ids.is_empty() {
                     fast_started = true;
-                    info!("snelle poll voor {:?} elke {}s", cfg.fast_ids, cfg.fast.as_secs());
+                    info!("fast poll for {:?} every {}s", cfg.fast_ids, cfg.fast.as_secs());
                     tokio::spawn(fast_loop(client.clone(), cfg.clone(), tx.clone()));
                 }
             }
             Err(e) => {
                 fails += 1;
                 if fails == 1 || fails % 10 == 0 {
-                    warn!("poll mislukt ({fails}x op rij): {e:#}");
+                    warn!("poll failed ({fails}x in a row): {e:#}");
                 }
             }
         }

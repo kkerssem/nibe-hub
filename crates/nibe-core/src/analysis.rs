@@ -1,4 +1,4 @@
-//! Query-laag boven de opslag: tijdreeksen, ruwe wijzigingen en de COP-analyse.
+//! Query layer on top of the store: time series, raw changes and the COP analysis.
 
 use crate::db::{PointInfo, Reader};
 use crate::series::{aggregate, build_segments, round, stat, Agg, Gap, Seg};
@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 pub const MAX_IDS: usize = 12;
 pub const MAX_RAW_ROWS: usize = 2000;
 
-/// Gaten en einde van de betrouwbare data voor het bereik `[from, to)`.
+/// Gaps and end of the reliable data for the range `[from, to)`.
 pub struct Coverage {
     pub gaps: Vec<Gap>,
     pub data_end: i64,
@@ -54,16 +54,16 @@ fn effective_len(b: (i64, i64), from: i64, to: i64) -> f64 {
 
 pub fn series_table(reader: &Reader, tz: Tz, ids: &[i64], from: i64, to: i64, bucket: Bucket, aggs: &[Agg]) -> Result<Value> {
     if ids.is_empty() {
-        bail!("geef minstens één punt-id op");
+        bail!("give at least one point id");
     }
     if ids.len() > MAX_IDS {
-        bail!("maximaal {MAX_IDS} punten per aanvraag");
+        bail!("at most {MAX_IDS} points per request");
     }
     let mut infos = Vec::new();
     for id in ids {
         match reader.point(*id)? {
             Some(i) => infos.push(i),
-            None => bail!("punt {id} bestaat niet; zoek met list_points"),
+            None => bail!("point {id} does not exist; search with list_points"),
         }
     }
     let mut legend = serde_json::Map::new();
@@ -89,7 +89,7 @@ pub fn series_table(reader: &Reader, tz: Tz, ids: &[i64], from: i64, to: i64, bu
             "timezone": tz.name(), "bucket": "raw", "series": legend,
             "columns": ["time", "id", "value"], "rows": rows,
             "notes": if truncated {
-                vec![format!("afgekapt op {MAX_RAW_ROWS} rijen; kies een korter bereik of een bucket")]
+                vec![format!("truncated at {MAX_RAW_ROWS} rows; choose a shorter range or a bucket")]
             } else { vec![] },
         }));
     }
@@ -108,7 +108,7 @@ pub fn series_table(reader: &Reader, tz: Tz, ids: &[i64], from: i64, to: i64, bu
     if aggs.contains(&Agg::IntegralKwh) {
         for i in &infos {
             if i.unit != "W" && i.unit != "kW" {
-                notes.push(format!("integral_kwh werkt alleen voor W of kW; punt {} is in {:?}", i.id, i.unit));
+                notes.push(format!("integral_kwh only works for W or kW; point {} is in {:?}", i.id, i.unit));
             }
         }
     }
@@ -124,7 +124,7 @@ pub fn series_table(reader: &Reader, tz: Tz, ids: &[i64], from: i64, to: i64, bu
                 vals.push(cell(aggregate(sg, e.0.max(from), e.1.min(to), *a, &info.unit)));
             }
         }
-        // geen lege rijen vóór het begin van de historie
+        // no empty rows before the start of the history
         if rows.is_empty() && vals.iter().all(Value::is_null) {
             continue;
         }
@@ -132,27 +132,27 @@ pub fn series_table(reader: &Reader, tz: Tz, ids: &[i64], from: i64, to: i64, bu
         row.extend(vals);
         rows.push(Value::Array(row));
     }
-    notes.push("coverage = aandeel van de bucket waarvoor de collector data heeft (laagste van alle gevraagde punten); gemiddelden en integralen gebruiken alleen gemeten tijd".into());
+    notes.push("coverage = share of the bucket for which the collector has data (lowest of all requested points); averages and integrals only use measured time".into());
     Ok(json!({
         "timezone": tz.name(), "bucket": bucket.label(), "series": legend,
         "columns": columns, "rows": rows, "notes": notes,
     }))
 }
 
-/// Efficiëntie per bucket uit de teller- en vermogenspunten van de S735C.
+/// Efficiency per bucket from the counter and power points of the S735C.
 pub fn cop_table(reader: &Reader, tz: Tz, from: i64, to: i64, bucket: Bucket) -> Result<Value> {
     if bucket == Bucket::Raw {
-        bail!("kies een bucket (bv. 1h of 1d)");
+        bail!("choose a bucket (e.g. 1h or 1d)");
     }
     let edges = bucket_edges(from, to, bucket, tz)?;
     if edges.len() > MAX_BUCKETS {
-        bail!("te veel buckets");
+        bail!("too many buckets");
     }
     let cov = coverage(reader, from, to)?;
     let need = |id: i64| -> Result<(PointInfo, Vec<Seg>)> {
         let info = reader
             .point(id)?
-            .ok_or_else(|| anyhow::anyhow!("punt {id} ontbreekt in de catalogus; draait de collector al?"))?;
+            .ok_or_else(|| anyhow::anyhow!("point {id} is missing from the catalogue; is the collector running?"))?;
         let s = segments(reader, &info, from, to, &cov)?;
         Ok((info, s))
     };
@@ -184,7 +184,7 @@ pub fn cop_table(reader: &Reader, tz: Tz, from: i64, to: i64, bucket: Bucket) ->
             (Some(p), Some(c)) if c >= 0.5 && p >= 0.0 => Some(p / c),
             _ => None,
         };
-        // Alleen betrouwbaar als de unit-elektra over (bijna) de hele bucket gemeten is.
+        // Only reliable if the unit's electricity was measured over (nearly) the whole bucket.
         let cop_integrated = match (prod, elec_unit) {
             (Some(p), Some(u)) if u >= 0.5 && p >= 0.0 && cov_frac > 0.9 => Some(p / u),
             _ => None,
@@ -198,7 +198,7 @@ pub fn cop_table(reader: &Reader, tz: Tz, from: i64, to: i64, bucket: Bucket) ->
             cell(aggregate(&on_s, b0, b1, Agg::Avg, &on_i.unit)),
         ];
         if rows.is_empty() && cells.iter().all(Value::is_null) {
-            continue; // nog geen historie in deze bucket
+            continue; // no history in this bucket yet
         }
         let mut row = vec![json!(fmt_ts(e.0, tz)), json!((cov_frac * 100.0).round() / 100.0)];
         row.extend(cells);
@@ -208,10 +208,10 @@ pub fn cop_table(reader: &Reader, tz: Tz, from: i64, to: i64, bucket: Bucket) ->
         "timezone": tz.name(), "bucket": bucket.label(),
         "columns": columns, "rows": rows,
         "notes": [
-            "elec_unit_kwh = ∫ 'Instantaneous used power' (punt 22130); elec_compressor_kwh = ∫ 'Compressor power input' (punt 1801)",
-            "counter_* = verschil van de levensduur-tellers (resolutie 0,1 kWh; punten 28392/28393 en 27378/27379). De betekenis van 28392/28393 is nog niet gevalideerd: als counter_consumed_kwh ≈ elec_unit_kwh klopt het.",
-            "cop_counters = counter_produced / counter_consumed (alleen bij ≥ 0,5 kWh verbruik); cop_produced_vs_integrated = counter_produced / elec_unit_kwh (alleen bij > 90% dekking)",
-            "COP uit NIBE's eigen warmte-schatting, geen onafhankelijke warmtemeter"
+            "elec_unit_kwh = ∫ 'Instantaneous used power' (point 22130); elec_compressor_kwh = ∫ 'Compressor power input' (point 1801)",
+            "counter_* = difference of the lifetime counters (resolution 0.1 kWh; points 28392/28393 and 27378/27379). The meaning of 28392/28393 is not validated yet: if counter_consumed_kwh ≈ elec_unit_kwh, it is correct.",
+            "cop_counters = counter_produced / counter_consumed (only with ≥ 0.5 kWh consumed); cop_produced_vs_integrated = counter_produced / elec_unit_kwh (only with > 90% coverage)",
+            "COP is based on NIBE's own heat estimate, not an independent heat meter"
         ],
     }))
 }

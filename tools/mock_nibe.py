@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Mock van de lokale NIBE REST-API voor ontwikkelen en testen.
+"""Mock of the local NIBE REST API for development and testing.
 
-Serveert een echte `/points`-dump (testdata/points.json.gz) over HTTPS met basic auth en laat
-een paar punten bewegen, zodat collector en MCP-server iets te registreren hebben.
+Serves a real `/points` dump (testdata/points.json.gz) over HTTPS with basic auth and makes
+a few points move, so the collector and MCP server have something to record.
 
-    python3 tools/mock_nibe.py --port 8443 --user nibe --password geheim
+    python3 tools/mock_nibe.py --port 8443 --user nibe --password secret
 """
 import argparse, base64, gzip, json, math, os, ssl, subprocess, tempfile, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -12,9 +12,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 ap = argparse.ArgumentParser()
 ap.add_argument("--port", type=int, default=8443)
 ap.add_argument("--user", default="nibe")
-ap.add_argument("--password", default="geheim")
+ap.add_argument("--password", default="secret")
 ap.add_argument("--data", default=os.path.join(os.path.dirname(__file__), "..", "testdata", "points.json.gz"))
-ap.add_argument("--speed", type=float, default=60.0, help="simulatietijd per echte seconde")
+ap.add_argument("--speed", type=float, default=60.0, help="simulated seconds per real second")
 args = ap.parse_args()
 
 with gzip.open(args.data, "rt") as f:
@@ -29,15 +29,15 @@ def sim_time():
 
 
 def current():
-    """Geeft een kopie van de dump met bewegende waarden."""
+    """Returns a copy of the dump with moving values."""
     now = time.time()
-    dt = (now - state["last"]) * args.speed / 3600.0  # gesimuleerde uren sinds vorige verzoek
+    dt = (now - state["last"]) * args.speed / 3600.0  # simulated hours since the previous request
     state["last"] = now
     t = sim_time()
     on = 1 if math.sin(t / 5400.0) > -0.3 else 0
     comp_w = int(250 + 150 * (math.sin(t / 900.0) + 1)) if on else 0
     unit_w = comp_w + 36
-    # 1 kWh elektra levert ~3,2 kWh warmte; tellers lopen alleen als de compressor draait
+    # 1 kWh of electricity yields ~3.2 kWh of heat; counters only advance while the compressor runs
     state["cons"] += unit_w / 1000.0 * dt
     state["prod"] += unit_w / 1000.0 * dt * 3.2
     state["heat"] += unit_w / 1000.0 * dt * 3.0
@@ -47,8 +47,8 @@ def current():
     def setv(pid, raw):
         out[str(pid)]["value"]["integerValue"] = int(round(raw))
 
-    setv(4, 80 + 40 * math.sin(t / 43200.0))            # buitentemp, /10
-    setv(22, 205 + 5 * math.sin(t / 7200.0))            # afvoerlucht
+    setv(4, 80 + 40 * math.sin(t / 43200.0))            # outdoor temperature, /10
+    setv(22, 205 + 5 * math.sin(t / 7200.0))            # exhaust air
     setv(23, 28 + 10 * on)
     setv(1801, comp_w)
     setv(1932, comp_w)
@@ -107,5 +107,5 @@ srv = ThreadingHTTPServer(("0.0.0.0", args.port), H)
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 ctx.load_cert_chain(cert, key)
 srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
-print(f"mock NIBE op https://0.0.0.0:{args.port} (user {args.user})", flush=True)
+print(f"mock NIBE on https://0.0.0.0:{args.port} (user {args.user})", flush=True)
 srv.serve_forever()

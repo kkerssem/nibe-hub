@@ -1,11 +1,11 @@
-//! Tijdparsing en bucket-grenzen (lokale tijdzone, DST-veilig).
+//! Time parsing and bucket boundaries (local time zone, DST-safe).
 
 use anyhow::{anyhow, bail, Result};
 use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveDateTime, Offset, TimeZone, Utc};
 use chrono_tz::Tz;
 
 pub fn parse_tz(name: &str) -> Result<Tz> {
-    name.parse::<Tz>().map_err(|_| anyhow!("onbekende tijdzone {name:?}"))
+    name.parse::<Tz>().map_err(|_| anyhow!("unknown time zone {name:?}"))
 }
 
 pub fn now_ms() -> i64 {
@@ -21,7 +21,7 @@ fn local_to_ms(naive: NaiveDateTime, tz: Tz) -> i64 {
     match tz.from_local_datetime(&naive) {
         chrono::LocalResult::Single(t) => t.timestamp_millis(),
         chrono::LocalResult::Ambiguous(a, _) => a.timestamp_millis(),
-        // niet-bestaand lokaal tijdstip (DST-sprong): schuif een uur op
+        // non-existent local time (DST jump): shift forward one hour
         chrono::LocalResult::None => tz
             .from_local_datetime(&(naive + Duration::hours(1)))
             .earliest()
@@ -30,8 +30,8 @@ fn local_to_ms(naive: NaiveDateTime, tz: Tz) -> i64 {
     }
 }
 
-/// Accepteert: `now`, `today`, `yesterday`, relatief (`-6h`, `-7d`, `-30m`, `-2w`),
-/// RFC 3339, `YYYY-MM-DD` (lokale middernacht) en `YYYY-MM-DD HH:MM[:SS]` (lokale tijd).
+/// Accepts: `now`, `today`, `yesterday`, relative (`-6h`, `-7d`, `-30m`, `-2w`),
+/// RFC 3339, `YYYY-MM-DD` (local midnight) and `YYYY-MM-DD HH:MM[:SS]` (local time).
 pub fn parse_time(s: &str, now: i64, tz: Tz) -> Result<i64> {
     let s = s.trim();
     match s.to_ascii_lowercase().as_str() {
@@ -56,7 +56,7 @@ pub fn parse_time(s: &str, now: i64, tz: Tz) -> Result<i64> {
                     'h' => 3_600_000,
                     'd' => 86_400_000,
                     'w' => 7 * 86_400_000,
-                    _ => bail!("onbekende eenheid in {s:?} (gebruik s, m, h, d of w)"),
+                    _ => bail!("unknown unit in {s:?} (use s, m, h, d or w)"),
                 };
                 return Ok(now - n * ms);
             }
@@ -74,7 +74,7 @@ pub fn parse_time(s: &str, now: i64, tz: Tz) -> Result<i64> {
         }
     }
     Err(anyhow!(
-        "tijd {s:?} niet te lezen; gebruik bv. \"-24h\", \"today\", \"2026-11-01\" of RFC 3339"
+        "cannot read time {s:?}; use e.g. \"-24h\", \"today\", \"2026-11-01\" or RFC 3339"
     ))
 }
 
@@ -121,20 +121,20 @@ pub fn parse_bucket(s: &str) -> Result<Bucket> {
         "1d" | "day" => Bucket::Day,
         "1w" | "week" => Bucket::Week,
         "1mo" | "month" => Bucket::Month,
-        other => bail!("onbekende bucket {other:?}; kies raw, 1m, 5m, 15m, 30m, 1h, 3h, 6h, 12h, 1d, 1w of 1mo"),
+        other => bail!("unknown bucket {other:?}; choose raw, 1m, 5m, 15m, 30m, 1h, 3h, 6h, 12h, 1d, 1w or 1mo"),
     })
 }
 
 pub const MAX_BUCKETS: usize = 2000;
 
-/// Bucketgrenzen `[start, einde)` die `[from, to)` bedekken. Dag/week/maand volgen de lokale kalender.
+/// Bucket boundaries `[start, end)` covering `[from, to)`. Day/week/month follow the local calendar.
 pub fn bucket_edges(from: i64, to: i64, bucket: Bucket, tz: Tz) -> Result<Vec<(i64, i64)>> {
     if to <= from {
-        bail!("`to` moet na `from` liggen");
+        bail!("`to` must be after `from`");
     }
     let mut out = Vec::new();
     match bucket {
-        Bucket::Raw => bail!("raw heeft geen buckets"),
+        Bucket::Raw => bail!("raw has no buckets"),
         Bucket::Fixed(size) => {
             let off = tz
                 .offset_from_utc_datetime(&Utc.timestamp_millis_opt(from).unwrap().naive_utc())
@@ -146,7 +146,7 @@ pub fn bucket_edges(from: i64, to: i64, bucket: Bucket, tz: Tz) -> Result<Vec<(i
                 out.push((start, start + size));
                 start += size;
                 if out.len() > MAX_BUCKETS {
-                    bail!("te veel buckets (>{MAX_BUCKETS}); kies een grotere bucket of een korter bereik");
+                    bail!("too many buckets (>{MAX_BUCKETS}); choose a larger bucket or a shorter range");
                 }
             }
         }
@@ -173,7 +173,7 @@ pub fn bucket_edges(from: i64, to: i64, bucket: Bucket, tz: Tz) -> Result<Vec<(i
                 out.push((s, e));
                 d = next;
                 if out.len() > MAX_BUCKETS {
-                    bail!("te veel buckets (>{MAX_BUCKETS}); kies een grotere bucket of een korter bereik");
+                    bail!("too many buckets (>{MAX_BUCKETS}); choose a larger bucket or a shorter range");
                 }
             }
         }
@@ -188,7 +188,7 @@ mod tests {
     #[test]
     fn days_follow_local_calendar_across_dst() {
         let tz = parse_tz("Europe/Amsterdam").unwrap();
-        // 25 okt 2026 is de overgang naar wintertijd: die dag duurt 25 uur
+        // 25 Oct 2026 is the switch to winter time: that day lasts 25 hours
         let from = parse_time("2026-10-24", 0, tz).unwrap();
         let to = parse_time("2026-10-27", 0, tz).unwrap();
         let e = bucket_edges(from, to, Bucket::Day, tz).unwrap();
@@ -201,6 +201,6 @@ mod tests {
         let tz = parse_tz("Europe/Amsterdam").unwrap();
         assert_eq!(parse_time("-6h", 10 * 3_600_000, tz).unwrap(), 4 * 3_600_000);
         assert!(parse_time("2026-11-15T10:00:00+01:00", 0, tz).is_ok());
-        assert!(parse_time("onzin", 0, tz).is_err());
+        assert!(parse_time("nonsense", 0, tz).is_err());
     }
 }

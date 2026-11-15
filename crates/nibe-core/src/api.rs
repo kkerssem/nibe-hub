@@ -1,4 +1,4 @@
-//! Typen voor de lokale NIBE REST-API (`/api/v1/devices/{n}/points`).
+//! Types for the local NIBE REST API (`/api/v1/devices/{n}/points`).
 
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
@@ -54,14 +54,14 @@ fn yes() -> bool {
 }
 
 impl ApiPoint {
-    /// De ruwe waarde, of `None` als de sensor ontbreekt of de waarde niet geldig is.
+    /// The raw value, or `None` if the sensor is missing or the value is not valid.
     pub fn raw(&self) -> Option<i64> {
         normalize_raw(&self.metadata.variable_size, self.value.is_ok, self.value.integer_value)
     }
 }
 
-/// NIBE geeft -32768 (s16) terug voor een sensor die niet is aangesloten.
-/// (255 bij een u8 is een gewone waarde, bv. "niet geconfigureerd", en blijft staan.)
+/// NIBE returns -32768 (s16) for a sensor that is not connected.
+/// (255 in a u8 is an ordinary value, e.g. "not configured", and is kept.)
 pub fn normalize_raw(size: &str, is_ok: bool, v: i64) -> Option<i64> {
     if !is_ok {
         return None;
@@ -72,19 +72,19 @@ pub fn normalize_raw(size: &str, is_ok: bool, v: i64) -> Option<i64> {
     Some(v)
 }
 
-/// Parseert het antwoord van `GET /points` (map id -> punt).
+/// Parses the response of `GET /points` (map id -> point).
 pub fn parse_points(body: &[u8]) -> Result<BTreeMap<i64, ApiPoint>> {
     let map: BTreeMap<String, ApiPoint> = serde_json::from_slice(body)?;
     let mut out = BTreeMap::new();
     for (k, p) in map {
-        let id: i64 = k.parse().map_err(|_| anyhow!("ongeldige punt-id {k:?}"))?;
+        let id: i64 = k.parse().map_err(|_| anyhow!("invalid point id {k:?}"))?;
         out.insert(id, p);
     }
     Ok(out)
 }
 
-/// Parseert het antwoord van `GET /points/{id}`. Accepteert één punt, een lijst of een map,
-/// zodat een afwijkende vorm van het firmware-antwoord niet meteen fataal is.
+/// Parses the response of `GET /points/{id}`. Accepts a single point, a list or a map,
+/// so an unexpected shape of the firmware response is not immediately fatal.
 pub fn parse_point_response(body: &[u8]) -> Result<Vec<ApiPoint>> {
     let v: Value = serde_json::from_slice(body)?;
     let mut out = Vec::new();
@@ -102,12 +102,12 @@ pub fn parse_point_response(body: &[u8]) -> Result<Vec<ApiPoint>> {
                 out.push(serde_json::from_value(it)?);
             }
         }
-        _ => return Err(anyhow!("onverwacht antwoord voor puntaanvraag")),
+        _ => return Err(anyhow!("unexpected response to point request")),
     }
     Ok(out)
 }
 
-/// Haalt de zachte afbreekstreepjes (U+00AD) uit titels, zoals de API ze meelevert.
+/// Removes the soft hyphens (U+00AD) that the API includes in titles.
 pub fn clean_title(s: &str) -> String {
     s.chars().filter(|c| *c != '\u{00ad}').collect()
 }
