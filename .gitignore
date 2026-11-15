@@ -1,0 +1,7 @@
+/target
+.DS_Store
+.env
+*.tar
+*.db
+*.db-shm
+*.db-wal
