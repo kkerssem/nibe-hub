@@ -186,6 +186,6 @@ Both binaries stop cleanly on SIGTERM (what `container stop` and RouterOS send) 
 ## Still to verify on the real pump
 
 1. **Meaning of points 28392/28393** ("Tot. production/consumption"). After a day, run `cop` with bucket `1d`; if `counter_consumed_kwh` ≈ `elec_unit_kwh` (the integral of point 22130), the interpretation is correct. Power points 1801 and 22130 are new compared to the Loxone route.
-2. **Fast poll**: the response of `/points/<id>` is undocumented; test `curl -k -u user:pass https://IP:8443/api/v1/devices/0/points/1801` before enabling `NIBE_FAST_IDS`.
-3. **Certificate pinning** works against the mock; check that the real pump's certificate stays the same across reboots.
+2. ~~**Fast poll**~~ (checked on 2026-11-15): `/points/<id>` returns a single point object, the same shape as an entry of `/points`, in about 15 ms; an unknown id gives HTTP 404 with `{"error": "Point not found"}`. `NIBE_FAST_IDS` can be enabled.
+3. **Certificate pinning** works against the real pump (a self-signed X.509 v3 EC certificate, valid until 3 October 2027). Check that it stays the same across pump reboots; after it is renewed, update `NIBE_TLS_FINGERPRINT`.
 4. The arm64 image builds with Apple Containers and runs locally against the mock, but the image import and the RouterOS commands have not been tried on a real RB5009.

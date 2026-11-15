@@ -111,3 +111,26 @@ pub fn parse_point_response(body: &[u8]) -> Result<Vec<ApiPoint>> {
 pub fn clean_title(s: &str) -> String {
     s.chars().filter(|c| *c != '\u{00ad}').collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verbatim response of `GET /api/v1/devices/0/points/1801` from an S735C-7 (firmware 4.6.x).
+    const POINT_1801: &str = r#"{"title": "Compres­sor power input", "description": "", "metadata": {"type": "metadata", "variableId": 1801, "variableType": "integer", "variableSize": "u16", "unit": "W", "modbusRegisterType": "MODBUS_INPUT_REGISTER", "shortUnit": "W", "isWritable": false, "divisor": 1, "decimal": 0, "modbusRegisterID": 1048, "minValue": 0, "maxValue": 0, "intDefaultValue": 0, "change": 202, "stringDefaultValue": ""}, "value": {"type": "datavalue", "isOk": true, "variableId": 1801, "integerValue": 372, "stringValue": ""}}"#;
+
+    #[test]
+    fn single_point_response_from_the_pump() {
+        let pts = parse_point_response(POINT_1801.as_bytes()).unwrap();
+        assert_eq!(pts.len(), 1);
+        let p = &pts[0];
+        assert_eq!((p.metadata.variable_id, p.raw()), (1801, Some(372)));
+        assert_eq!(clean_title(&p.title), "Compressor power input");
+    }
+
+    #[test]
+    fn not_found_response_is_an_error() {
+        // the pump answers 404 with this body; `get` fails on the status first, but the parser must not accept it either
+        assert!(parse_point_response(br#"{"error": "Point not found"}"#).is_err());
+    }
+}
