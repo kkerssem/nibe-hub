@@ -39,7 +39,6 @@ COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certifica
 COPY --from=build /out/nibe-collector /out/nibe-mcp /
 ENV DB_PATH=/data/nibe.db RUST_LOG=info
 VOLUME /data
-EXPOSE 8080 443
 # A default command rather than a fixed entrypoint, so the binary can be chosen per container:
 # MikroTik Apps only have `command` (e.g. `command: /nibe-mcp`); RouterOS /container and
 # `container run` can also set entrypoint= / --entrypoint.
